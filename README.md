@@ -37,7 +37,7 @@ Requirements: Visual Studio 2019+, .NET Framework 4.7.2+, BepInEx installed to a
 
 ```bash
 # Setup references (edit paths in setup-references.ps1)
-.\setup-references.ps1 -UltrakillPath "F:\Program Files (x86)\Steam\steamapps\common\ULTRAKILL"
+.\setup-references.ps1 -UnityPath "F:\Program Files (x86)\Steam\steamapps\common\ULTRAKILL"
 
 # Build
 .\build.ps1 -Deploy -UnityPath "F:\Program Files (x86)\Steam\steamapps\common\ULTRAKILL"

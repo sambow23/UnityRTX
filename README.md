@@ -1,5 +1,5 @@
 # UnityRTX
-A BepInEx plugin that brings NVIDIA RTX Remix path tracing to most Unity games.
+A BepInEx plugin that brings NVIDIA RTX Remix path tracing to most modern Unity games.
 
 | Supported Features |   |
 |--------------------|---|

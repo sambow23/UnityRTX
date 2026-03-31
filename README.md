@@ -9,7 +9,7 @@ A BepInEx plugin that brings NVIDIA RTX Remix path tracing to most modern Unity 
 | Point and spot lights (that are not baked) |✅|
 | Directional lights |❌|
 | Particle systems |❌|
-| GPU-Instanced / Statically Batched Geometry |❌|
+| GPU-Instanced / Statically Batched Geometry |✅|
 
 ## Requirements
 

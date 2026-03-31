@@ -37,6 +37,9 @@ namespace UnityRemix
         private ConfigEntry<bool> configCaptureTextures;
         private ConfigEntry<bool> configCaptureMaterials;
         
+        // Scene mesh scanner settings
+        private ConfigEntry<bool> configEnableSceneScan;
+        
         public static ManualLogSource LogSource { get; private set; }
         private RemixAPI.remixapi_Interface remixInterface;
         private IntPtr remixDll = IntPtr.Zero;
@@ -52,6 +55,7 @@ namespace UnityRemix
         private RemixFrameCapture frameCapture;
         private RemixRenderThread renderThread;
         private TextureCategoryManager textureCategoryManager;
+        private SceneMeshScanner sceneMeshScanner;
         
         private int frameCount = 0;
         private static bool isQuitting = false;
@@ -148,6 +152,10 @@ namespace UnityRemix
             configCaptureMaterials = Config.Bind("Debug", "CaptureMaterials", true,
                 "Enable material capturing and creation.");
             
+            // Scene scan settings
+            configEnableSceneScan = Config.Bind("SceneScan", "EnableSceneScan", true,
+                "Enable runtime scene scanning to find all static level geometry (including inactive objects). No external bake tool needed.");
+            
             LogSource.LogInfo("Configuration loaded:");
             LogSource.LogInfo($"  Camera Name: '{configCameraName.Value}' (empty = auto-detect)");
             LogSource.LogInfo($"  Camera Tag: '{configCameraTag.Value}'");
@@ -171,6 +179,11 @@ namespace UnityRemix
             // Invalidate caches
             frameCapture?.InvalidateCaches();
             lightConverter?.ClearCache();
+            sceneMeshScanner?.ClearData();
+            
+            // Trigger scene scan
+            if (configEnableSceneScan.Value)
+                sceneMeshScanner?.OnSceneLoaded(scene);
             
             // Refresh light cache on scene load
             lightConverter?.RefreshLightCache();
@@ -309,6 +322,16 @@ namespace UnityRemix
                 remixInterface
             );
             
+            sceneMeshScanner = new SceneMeshScanner(
+                LogSource,
+                meshConverter,
+                materialManager,
+                remixApiLock
+            );
+            
+            // Give render thread access to scene mesh scanner
+            renderThread.SetSceneMeshScanner(sceneMeshScanner);
+            
             LogSource.LogInfo("All components initialized");
         }
         
@@ -358,6 +381,10 @@ namespace UnityRemix
             frameCount++;
             
             // Device registration happens via InvokeRepeating in TryRegisterDevice
+            
+            // Rescan for async-loaded meshes (Addressables, etc.)
+            if (configEnableSceneScan.Value)
+                sceneMeshScanner?.Update(Time.unscaledDeltaTime);
         }
         
         void LateUpdate()

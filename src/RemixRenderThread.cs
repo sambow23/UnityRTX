@@ -39,6 +39,9 @@ namespace UnityRemix
         private volatile RemixFrameCapture.FrameState currentFrameState = new RemixFrameCapture.FrameState();
         private readonly object captureLock = new object();
         
+        // Scene mesh scanner (optional)
+        private SceneMeshScanner sceneMeshScanner;
+        
         public RemixRenderThread(
             ManualLogSource logger,
             RemixWindowManager windowManager,
@@ -69,6 +72,14 @@ namespace UnityRemix
                 presentFunc = Marshal.GetDelegateForFunctionPointer<RemixAPI.PFN_remixapi_Present>(
                     remixInterface.Present);
             }
+        }
+        
+        /// <summary>
+        /// Set the scene mesh scanner for drawing scanned level geometry.
+        /// </summary>
+        public void SetSceneMeshScanner(SceneMeshScanner scanner)
+        {
+            sceneMeshScanner = scanner;
         }
         
         /// <summary>
@@ -282,6 +293,38 @@ namespace UnityRemix
                 {
                     meshConverter.DrawMeshInstance(meshHandle, instance.localToWorld, objectPickingValue);
                     objectPickingValue++;
+                }
+            }
+            
+            // Draw scanned scene mesh instances
+            // Always call GetInstances during streaming to drain the queue
+            if (sceneMeshScanner != null && (sceneMeshScanner.HasData || sceneMeshScanner.IsStreaming))
+            {
+                var scannedInstances = sceneMeshScanner.GetInstances();
+                if (scannedInstances != null)
+                {
+                    var drawFunc = meshConverter.GetDrawInstanceFunc();
+                    if (drawFunc != null)
+                    {
+                        foreach (var instance in scannedInstances)
+                        {
+                            if (instance.MeshHandle == IntPtr.Zero)
+                                continue;
+                            
+                            var instanceInfo = new RemixAPI.remixapi_InstanceInfo
+                            {
+                                sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_INSTANCE_INFO,
+                                pNext = IntPtr.Zero,
+                                categoryFlags = 0,
+                                mesh = instance.MeshHandle,
+                                transform = instance.Transform,
+                                doubleSided = 1
+                            };
+                            
+                            drawFunc(ref instanceInfo);
+                            objectPickingValue++;
+                        }
+                    }
                 }
             }
             

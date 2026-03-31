@@ -630,6 +630,16 @@ namespace UnityRemix
         }
         
         /// <summary>
+        /// Expose CreateMesh delegate for external callers (e.g. SceneMeshScanner).
+        /// </summary>
+        public RemixAPI.PFN_remixapi_CreateMesh GetCreateMeshFunc() => createMeshFunc;
+        
+        /// <summary>
+        /// Expose DrawInstance delegate for external callers (e.g. SceneMeshScanner).
+        /// </summary>
+        public RemixAPI.PFN_remixapi_DrawInstance GetDrawInstanceFunc() => drawInstanceFunc;
+        
+        /// <summary>
         /// Cleanup all resources
         /// </summary>
         public void Cleanup()

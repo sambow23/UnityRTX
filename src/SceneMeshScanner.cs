@@ -21,15 +21,20 @@ namespace UnityRemix
         private readonly RemixMaterialManager materialManager;
         private readonly object apiLock;
 
+        private struct SubMeshSurface
+        {
+            public int[] Indices;
+            public int MaterialId;
+        }
+
         private struct ScannedMeshData
         {
             public ulong MeshHash;
             public Vector3[] Vertices;
             public Vector3[] Normals;
             public Vector2[] UVs;
-            public int[] Indices;
+            public SubMeshSurface[] Surfaces;
             public Matrix4x4 LocalToWorld;
-            public int MaterialId;
         }
 
         public struct InstanceData
@@ -53,9 +58,7 @@ namespace UnityRemix
         // Track which MeshFilter instance IDs we've already scanned (avoids duplicates across rescans)
         private readonly HashSet<int> scannedFilterIds = new HashSet<int>();
 
-        // Track combined meshes (static batching) already queued — their vertices are pre-transformed
-        // to world space, so we use identity transform and only queue one instance per combined mesh.
-        private readonly HashSet<int> queuedCombinedMeshIds = new HashSet<int>();
+
 
         // Rescan state: async-loaded objects appear after OnSceneLoaded
         private Scene activeScene;
@@ -160,13 +163,13 @@ namespace UnityRemix
             lock (streamLock) { streamingQueue.Clear(); }
             meshHandles.Clear();
             scannedFilterIds.Clear();
-            queuedCombinedMeshIds.Clear();
             activeScene = default;
         }
 
         private int ScanScene(Scene scene, bool logDiagnostics)
         {
             var filters = Resources.FindObjectsOfTypeAll<MeshFilter>();
+            var combinedDataCache = new Dictionary<int, (Vector3[] verts, Vector3[] norms, Vector2[] uvs, int[][] subIndices)>();
             int queued = 0;
             int skippedAlreadyScanned = 0, skippedWrongScene = 0, skippedNoRenderer = 0;
             int skippedNoMesh = 0, skippedNoVerts = 0, skippedNoTris = 0, skippedReadError = 0;
@@ -206,19 +209,10 @@ namespace UnityRemix
                     continue;
                 }
 
-                // Unity's static batching replaces individual meshes with a single "Combined Mesh"
-                // whose vertices are already in world space. Only queue one instance (identity transform).
+                // Unity's static batching merges renderers into a single "Combined Mesh" with
+                // pre-transformed world-space vertices. Each renderer owns a slice of submeshes
+                // at [subMeshStartIndex .. subMeshStartIndex + sharedMaterials.Length).
                 bool isCombinedMesh = mesh.name != null && mesh.name.StartsWith("Combined Mesh");
-                if (isCombinedMesh)
-                {
-                    int meshObjId = mesh.GetInstanceID();
-                    if (queuedCombinedMeshIds.Contains(meshObjId))
-                    {
-                        scannedFilterIds.Add(filterId);
-                        continue;
-                    }
-                    queuedCombinedMeshIds.Add(meshObjId);
-                }
 
                 // Mark scanned before extraction — even if geometry is empty we won't retry
                 scannedFilterIds.Add(filterId);
@@ -226,35 +220,53 @@ namespace UnityRemix
                 Vector3[] vertices = null;
                 Vector3[] normals = null;
                 Vector2[] uvs = null;
-                int[] indices = null;
+                int[][] subMeshIndices = null;
 
-                try
+                // For combined meshes, reuse cached vertex/index data across renderers
+                if (isCombinedMesh)
                 {
-                    vertices = mesh.vertices;
+                    int meshId = mesh.GetInstanceID();
+                    if (combinedDataCache.TryGetValue(meshId, out var cached))
+                    {
+                        vertices = cached.verts;
+                        normals = cached.norms;
+                        uvs = cached.uvs;
+                        subMeshIndices = cached.subIndices;
+                    }
                 }
-                catch { }
 
-                if (vertices != null && vertices.Length > 0)
+                if (vertices == null)
                 {
-                    // Fast path: CPU mesh data available
-                    normals = mesh.normals;
-                    uvs = mesh.uv;
-                    indices = ExtractTriangleIndices(mesh);
-                }
-                else if (mesh.vertexCount > 0)
-                {
-                    // GPU readback path: vertex data is GPU-only
                     try
                     {
-                        if (ReadMeshFromGPU(mesh, out vertices, out normals, out uvs, out indices))
-                            gpuReadbackCount++;
+                        vertices = mesh.vertices;
                     }
-                    catch (Exception ex)
+                    catch { }
+
+                    if (vertices != null && vertices.Length > 0)
                     {
-                        logger.LogWarning($"GPU readback failed for mesh '{mesh.name}': {ex.Message}");
-                        skippedReadError++;
-                        continue;
+                        // Fast path: CPU mesh data available
+                        normals = mesh.normals;
+                        uvs = mesh.uv;
                     }
+                    else if (mesh.vertexCount > 0)
+                    {
+                        // GPU readback path: vertex data is GPU-only
+                        try
+                        {
+                            if (ReadMeshFromGPU(mesh, out vertices, out normals, out uvs, out subMeshIndices))
+                                gpuReadbackCount++;
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogWarning($"GPU readback failed for mesh '{mesh.name}': {ex.Message}");
+                            skippedReadError++;
+                            continue;
+                        }
+                    }
+
+                    if (isCombinedMesh && vertices != null && vertices.Length > 0)
+                        combinedDataCache[mesh.GetInstanceID()] = (vertices, normals, uvs, subMeshIndices);
                 }
 
                 if (vertices == null || vertices.Length == 0)
@@ -263,35 +275,92 @@ namespace UnityRemix
                     continue;
                 }
 
-                if (indices == null || indices.Length == 0 || indices.Length % 3 != 0)
+                // Build per-submesh surfaces with separate materials
+                var materials = renderer.sharedMaterials;
+                var surfaces = new List<SubMeshSurface>();
+
+                // For combined meshes, each renderer only owns a slice of submeshes
+                int subStart = 0;
+                int subEnd = mesh.subMeshCount;
+                if (isCombinedMesh)
+                {
+                    subStart = renderer.subMeshStartIndex;
+                    subEnd = Math.Min(subStart + (materials != null ? materials.Length : 0), mesh.subMeshCount);
+                    if (subStart >= subEnd)
+                        continue;
+                }
+
+                if (subMeshIndices == null)
+                {
+                    // CPU path — extract per-submesh indices for this renderer's range
+                    var subList = new List<int[]>();
+                    for (int sub = subStart; sub < subEnd; sub++)
+                    {
+                        if (mesh.GetTopology(sub) != MeshTopology.Triangles)
+                        {
+                            subList.Add(null);
+                            continue;
+                        }
+                        var tris = mesh.GetTriangles(sub);
+                        subList.Add(tris != null && tris.Length > 0 ? tris : null);
+                    }
+                    subMeshIndices = subList.ToArray();
+                }
+                else if (isCombinedMesh)
+                {
+                    // GPU readback / cache returned all submeshes — extract only this renderer's range
+                    int rangeCount = Math.Min(subEnd, subMeshIndices.Length) - subStart;
+                    if (rangeCount > 0)
+                    {
+                        var subset = new int[rangeCount][];
+                        Array.Copy(subMeshIndices, subStart, subset, 0, rangeCount);
+                        subMeshIndices = subset;
+                    }
+                }
+
+                for (int sub = 0; sub < subMeshIndices.Length; sub++)
+                {
+                    var tris = subMeshIndices[sub];
+                    if (tris == null || tris.Length == 0)
+                        continue;
+
+                    int matId = 0;
+                    if (materials != null && sub < materials.Length && materials[sub] != null)
+                    {
+                        matId = materials[sub].GetInstanceID();
+                        materialManager.CaptureMaterialTextures(materials[sub], matId);
+                    }
+                    surfaces.Add(new SubMeshSurface { Indices = tris, MaterialId = matId });
+                }
+
+                // For combined meshes, compact vertex arrays so each Remix mesh only
+                // includes the vertices referenced by this renderer's submeshes
+                if (isCombinedMesh && surfaces.Count > 0)
+                    CompactMeshData(ref vertices, ref normals, ref uvs, surfaces);
+
+                if (surfaces.Count == 0)
                 {
                     skippedNoTris++;
                     continue;
                 }
 
-                // Validate indices
+                // Validate indices across all surfaces
                 bool valid = true;
-                for (int i = 0; i < indices.Length; i++)
+                foreach (var surf in surfaces)
                 {
-                    if (indices[i] < 0 || indices[i] >= vertices.Length)
+                    if (surf.Indices.Length % 3 != 0) { valid = false; break; }
+                    for (int i = 0; i < surf.Indices.Length; i++)
                     {
-                        valid = false;
-                        break;
+                        if (surf.Indices[i] < 0 || surf.Indices[i] >= vertices.Length)
+                        { valid = false; break; }
                     }
+                    if (!valid) break;
                 }
                 if (!valid)
                     continue;
 
-                // Capture material textures on main thread (accesses Unity textures/GPU)
-                int materialId = 0;
-                var material = renderer.sharedMaterial;
-                if (material != null)
-                {
-                    materialId = material.GetInstanceID();
-                    materialManager.CaptureMaterialTextures(material, materialId);
-                }
-
-                ulong meshHash = RemixMeshConverter.GenerateMeshHash(mesh);
+                // Use filter instance ID in hash so each object gets its own Remix mesh + material binding
+                ulong meshHash = GenerateInstanceMeshHash(mesh, filterId);
 
                 lock (streamLock)
                 {
@@ -301,9 +370,8 @@ namespace UnityRemix
                         Vertices = vertices,
                         Normals = normals,
                         UVs = uvs,
-                        Indices = indices,
+                        Surfaces = surfaces.ToArray(),
                         LocalToWorld = isCombinedMesh ? Matrix4x4.identity : filter.transform.localToWorldMatrix,
-                        MaterialId = materialId
                     });
                 }
                 queued++;
@@ -403,98 +471,160 @@ namespace UnityRemix
                 );
             }
 
-            uint[] indices = new uint[data.Indices.Length];
-            for (int i = 0; i < data.Indices.Length; i++)
-                indices[i] = (uint)data.Indices[i];
-
             GCHandle vertexHandle = GCHandle.Alloc(remixVerts, GCHandleType.Pinned);
-            GCHandle indexHandle = GCHandle.Alloc(indices, GCHandleType.Pinned);
+            var indexHandles = new List<GCHandle>();
+            var surfaceHandles = new List<GCHandle>();
 
             try
             {
-                IntPtr materialHandle = IntPtr.Zero;
-                if (data.MaterialId != 0)
-                    materialHandle = materialManager.GetOrCreateMaterial(data.MaterialId);
-
-                var surface = new RemixAPI.remixapi_MeshInfoSurfaceTriangles
+                // Build one surface per submesh, each with its own material
+                var surfaces = new RemixAPI.remixapi_MeshInfoSurfaceTriangles[data.Surfaces.Length];
+                for (int s = 0; s < data.Surfaces.Length; s++)
                 {
-                    vertices_values = vertexHandle.AddrOfPinnedObject(),
-                    vertices_count = (ulong)remixVerts.Length,
-                    indices_values = indexHandle.AddrOfPinnedObject(),
-                    indices_count = (ulong)indices.Length,
-                    skinning_hasvalue = 0,
-                    skinning_value = new RemixAPI.remixapi_MeshInfoSkinning(),
-                    material = materialHandle
+                    var surf = data.Surfaces[s];
+                    uint[] surfIndices = new uint[surf.Indices.Length];
+                    for (int i = 0; i < surf.Indices.Length; i++)
+                        surfIndices[i] = (uint)surf.Indices[i];
+
+                    GCHandle idxHandle = GCHandle.Alloc(surfIndices, GCHandleType.Pinned);
+                    indexHandles.Add(idxHandle);
+
+                    IntPtr materialHandle = IntPtr.Zero;
+                    if (surf.MaterialId != 0)
+                        materialHandle = materialManager.GetOrCreateMaterial(surf.MaterialId);
+
+                    surfaces[s] = new RemixAPI.remixapi_MeshInfoSurfaceTriangles
+                    {
+                        vertices_values = vertexHandle.AddrOfPinnedObject(),
+                        vertices_count = (ulong)remixVerts.Length,
+                        indices_values = idxHandle.AddrOfPinnedObject(),
+                        indices_count = (ulong)surfIndices.Length,
+                        skinning_hasvalue = 0,
+                        skinning_value = new RemixAPI.remixapi_MeshInfoSkinning(),
+                        material = materialHandle
+                    };
+                }
+
+                GCHandle surfaceArrayHandle = GCHandle.Alloc(surfaces, GCHandleType.Pinned);
+                surfaceHandles.Add(surfaceArrayHandle);
+
+                var meshInfo = new RemixAPI.remixapi_MeshInfo
+                {
+                    sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_MESH_INFO,
+                    pNext = IntPtr.Zero,
+                    hash = data.MeshHash,
+                    surfaces_values = surfaceArrayHandle.AddrOfPinnedObject(),
+                    surfaces_count = (uint)surfaces.Length
                 };
 
-                GCHandle surfaceHandle = GCHandle.Alloc(surface, GCHandleType.Pinned);
-
-                try
+                IntPtr handle;
+                RemixAPI.remixapi_ErrorCode result;
+                lock (apiLock)
                 {
-                    var meshInfo = new RemixAPI.remixapi_MeshInfo
-                    {
-                        sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_MESH_INFO,
-                        pNext = IntPtr.Zero,
-                        hash = data.MeshHash,
-                        surfaces_values = surfaceHandle.AddrOfPinnedObject(),
-                        surfaces_count = 1
-                    };
-
-                    IntPtr handle;
-                    RemixAPI.remixapi_ErrorCode result;
-                    lock (apiLock)
-                    {
-                        var createFunc = meshConverter.GetCreateMeshFunc();
-                        if (createFunc == null)
-                            return IntPtr.Zero;
-                        result = createFunc(ref meshInfo, out handle);
-                    }
-
-                    if (result != RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
-                    {
-                        logger.LogError($"Failed to create scanned mesh 0x{data.MeshHash:X16}: {result}");
+                    var createFunc = meshConverter.GetCreateMeshFunc();
+                    if (createFunc == null)
                         return IntPtr.Zero;
-                    }
+                    result = createFunc(ref meshInfo, out handle);
+                }
 
-                    meshHandles[data.MeshHash] = handle;
-                    return handle;
-                }
-                finally
+                if (result != RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
                 {
-                    surfaceHandle.Free();
+                    logger.LogError($"Failed to create scanned mesh 0x{data.MeshHash:X16}: {result}");
+                    return IntPtr.Zero;
                 }
+
+                meshHandles[data.MeshHash] = handle;
+                return handle;
             }
             finally
             {
                 vertexHandle.Free();
-                indexHandle.Free();
+                foreach (var h in indexHandles) h.Free();
+                foreach (var h in surfaceHandles) h.Free();
             }
         }
 
-        private static int[] ExtractTriangleIndices(Mesh mesh)
+        private static ulong GenerateInstanceMeshHash(Mesh mesh, int instanceId)
         {
-            var allIndices = new List<int>();
-            for (int i = 0; i < mesh.subMeshCount; i++)
+            ulong hash = 14695981039346656037UL; // FNV offset basis
+
+            // Include instance ID so each object gets a unique Remix mesh
+            hash ^= (ulong)(uint)instanceId;
+            hash *= 1099511628211UL;
+
+            if (!string.IsNullOrEmpty(mesh.name))
             {
-                if (mesh.GetTopology(i) != MeshTopology.Triangles)
-                    continue;
-                var tris = mesh.GetTriangles(i);
-                if (tris != null && tris.Length > 0)
-                    allIndices.AddRange(tris);
+                foreach (char c in mesh.name)
+                {
+                    hash ^= c;
+                    hash *= 1099511628211UL;
+                }
             }
-            return allIndices.ToArray();
+
+            hash ^= (ulong)mesh.vertexCount;
+            hash *= 1099511628211UL;
+
+            return hash;
+        }
+
+        /// <summary>
+        /// Compacts vertex/normal/UV arrays to only include vertices referenced by the
+        /// given surfaces, and remaps all surface indices accordingly. Used for combined
+        /// meshes where each renderer uses a small slice of a large shared vertex buffer.
+        /// </summary>
+        private static void CompactMeshData(
+            ref Vector3[] vertices, ref Vector3[] normals, ref Vector2[] uvs,
+            List<SubMeshSurface> surfaces)
+        {
+            var usedSet = new HashSet<int>();
+            foreach (var surf in surfaces)
+                foreach (int idx in surf.Indices)
+                    usedSet.Add(idx);
+
+            if (usedSet.Count == vertices.Length)
+                return;
+
+            var sorted = new int[usedSet.Count];
+            usedSet.CopyTo(sorted);
+            Array.Sort(sorted);
+
+            var remap = new Dictionary<int, int>(sorted.Length);
+            for (int i = 0; i < sorted.Length; i++)
+                remap[sorted[i]] = i;
+
+            var newVerts = new Vector3[sorted.Length];
+            var newNorms = normals != null && normals.Length == vertices.Length
+                ? new Vector3[sorted.Length] : null;
+            var newUvs = uvs != null && uvs.Length == vertices.Length
+                ? new Vector2[sorted.Length] : null;
+
+            for (int i = 0; i < sorted.Length; i++)
+            {
+                int old = sorted[i];
+                newVerts[i] = vertices[old];
+                if (newNorms != null) newNorms[i] = normals[old];
+                if (newUvs != null) newUvs[i] = uvs[old];
+            }
+
+            foreach (var surf in surfaces)
+                for (int i = 0; i < surf.Indices.Length; i++)
+                    surf.Indices[i] = remap[surf.Indices[i]];
+
+            vertices = newVerts;
+            normals = newNorms;
+            uvs = newUvs;
         }
 
         /// <summary>
         /// Reads vertex data from GPU buffers for meshes where CPU data is unavailable.
         /// Uses Mesh.GetVertexBuffer/GetIndexBuffer which bypass the isReadable check.
         /// </summary>
-        private bool ReadMeshFromGPU(Mesh mesh, out Vector3[] positions, out Vector3[] normals, out Vector2[] uvs, out int[] indices)
+        private bool ReadMeshFromGPU(Mesh mesh, out Vector3[] positions, out Vector3[] normals, out Vector2[] uvs, out int[][] subMeshIndices)
         {
             positions = null;
             normals = null;
             uvs = null;
-            indices = null;
+            subMeshIndices = null;
 
             int vertexCount = mesh.vertexCount;
             if (vertexCount == 0)
@@ -582,50 +712,66 @@ namespace UnityRemix
                 }
             }
 
-            // Read index buffer from GPU
+            // Read index buffer from GPU, split by submesh
             GraphicsBuffer indexBuffer = mesh.GetIndexBuffer();
             if (indexBuffer == null)
                 return false;
 
+            int totalIndices = 0;
             try
             {
                 bool is32Bit = mesh.indexFormat == IndexFormat.UInt32;
-                int indexCount = (int)mesh.GetIndexCount(0);
 
-                // Collect indices from all triangle submeshes
-                var allIndices = new List<int>();
+                // Read the full index buffer once
+                int[] intBuf = null;
+                ushort[] shortBuf = null;
+                if (is32Bit)
+                {
+                    intBuf = new int[indexBuffer.count];
+                    indexBuffer.GetData(intBuf);
+                }
+                else
+                {
+                    shortBuf = new ushort[indexBuffer.count];
+                    indexBuffer.GetData(shortBuf);
+                }
+
+                // Split into per-submesh arrays
+                var subList = new List<int[]>();
                 for (int sub = 0; sub < mesh.subMeshCount; sub++)
                 {
                     if (mesh.GetTopology(sub) != MeshTopology.Triangles)
+                    {
+                        subList.Add(null);
                         continue;
+                    }
                     var desc = mesh.GetSubMesh(sub);
                     int start = desc.indexStart;
                     int count = desc.indexCount;
+                    var tris = new int[count];
 
                     if (is32Bit)
                     {
-                        var buf = new int[indexBuffer.count];
-                        indexBuffer.GetData(buf);
-                        for (int i = start; i < start + count; i++)
-                            allIndices.Add(buf[i]);
+                        for (int i = 0; i < count; i++)
+                            tris[i] = intBuf[start + i];
                     }
                     else
                     {
-                        var buf = new ushort[indexBuffer.count];
-                        indexBuffer.GetData(buf);
-                        for (int i = start; i < start + count; i++)
-                            allIndices.Add(buf[i]);
+                        for (int i = 0; i < count; i++)
+                            tris[i] = shortBuf[start + i];
                     }
+                    subList.Add(tris);
+                    totalIndices += count;
                 }
-                indices = allIndices.ToArray();
+                subMeshIndices = subList.ToArray();
             }
             finally
             {
                 indexBuffer.Dispose();
             }
 
-            logger.LogInfo($"GPU readback: mesh '{mesh.name}' — {vertexCount} verts, {indices.Length} indices");
-            return positions.Length > 0 && indices.Length > 0;
+            logger.LogInfo($"GPU readback: mesh '{mesh.name}' — {vertexCount} verts, {totalIndices} indices, {mesh.subMeshCount} submeshes");
+            return positions.Length > 0 && totalIndices > 0;
         }
 
         private static Vector3 ReadVector3(byte[] data, int offset, VertexAttributeFormat format)

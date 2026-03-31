@@ -28,6 +28,11 @@ namespace UnityRemix
         
         // Cache for uploaded textures - maps Unity texture instance ID to Remix handle
         private Dictionary<int, IntPtr> textureCache = new Dictionary<int, IntPtr>();
+
+        // Debug texture for meshes with no albedo — visible in Remix so it can be categorized/hidden
+        private IntPtr debugTextureHandle = IntPtr.Zero;
+        private ulong debugTextureHash;
+        private const string DebugTextureHashPath = "0xDEBB0600DEBB0600"; // stable sentinel
         
         // Cache for texture hashes - maps Unity texture instance ID to XXH64 hash
         private Dictionary<int, ulong> textureHashCache = new Dictionary<int, ulong>();
@@ -493,7 +498,14 @@ namespace UnityRemix
                 string normalPath = GetTexturePathFromHandle(matData.normalHandle);
                 ulong matHash = GenerateMaterialHash(matData.materialName, materialId);
                 
-                // Log texture paths for debugging
+                // Use debug placeholder for materials with no albedo texture
+                if (albedoPath == null)
+                {
+                    EnsureDebugTexture();
+                    if (debugTextureHandle != IntPtr.Zero)
+                        albedoPath = DebugTextureHashPath;
+                }
+
                 logger.LogInfo($"Creating material '{matData.materialName}': albedo={albedoPath ?? "none"}, normal={normalPath ?? "none"}");
                 
                 var materialInfo = new RemixAPI.remixapi_MaterialInfo
@@ -538,6 +550,73 @@ namespace UnityRemix
             }
         }
         
+        /// <summary>
+        /// Lazily creates the debug texture on first use (must be called from render thread
+        /// after the Remix device is registered).
+        /// </summary>
+        private void EnsureDebugTexture()
+        {
+            if (debugTextureHandle != IntPtr.Zero)
+                return;
+            CreateDebugTexture();
+        }
+
+        private void CreateDebugTexture()
+        {
+            if (createTextureFunc == null)
+                return;
+
+            const int size = 8;
+            byte[] pixels = new byte[size * size * 4];
+            for (int y = 0; y < size; y++)
+            {
+                for (int x = 0; x < size; x++)
+                {
+                    int i = (y * size + x) * 4;
+                    bool checker = ((x + y) & 1) == 0;
+                    pixels[i + 0] = checker ? (byte)255 : (byte)0; // R
+                    pixels[i + 1] = 0;                             // G
+                    pixels[i + 2] = checker ? (byte)255 : (byte)0; // B
+                    pixels[i + 3] = 255;                           // A
+                }
+            }
+
+            debugTextureHash = 0xDEBB0600DEBB0600UL;
+
+            GCHandle pinned = GCHandle.Alloc(pixels, GCHandleType.Pinned);
+            try
+            {
+                var info = new RemixAPI.remixapi_TextureInfo
+                {
+                    sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_TEXTURE_INFO,
+                    pNext = IntPtr.Zero,
+                    hash = debugTextureHash,
+                    width = size,
+                    height = size,
+                    depth = 1,
+                    mipLevels = 1,
+                    format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_SRGB,
+                    data = pinned.AddrOfPinnedObject(),
+                    dataSize = (ulong)pixels.Length
+                };
+
+                RemixAPI.remixapi_ErrorCode result;
+                lock (apiLock)
+                {
+                    result = createTextureFunc(ref info, out debugTextureHandle);
+                }
+
+                if (result == RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
+                    logger.LogInfo($"Created debug placeholder texture (hash: 0x{debugTextureHash:X16})");
+                else
+                    logger.LogWarning($"Failed to create debug texture: {result}");
+            }
+            finally
+            {
+                pinned.Free();
+            }
+        }
+
         /// <summary>
         /// Cleanup resources
         /// </summary>

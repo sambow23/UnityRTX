@@ -169,6 +169,10 @@ namespace UnityRemix
         private HashSet<int> meshesInQueue = new HashSet<int>(); // Track which meshes are already queued
         
         private int skinnedCaptureCount = 0;
+        private int skinnedRoundRobinIndex = 0; // rotates through cachedSkinnedRenderers each frame
+        
+        // Persistent cache: last-baked data for every skinned mesh, so all are drawn every frame
+        private Dictionary<int, SkinnedMeshData> persistentSkinnedData = new Dictionary<int, SkinnedMeshData>();
         
         // Track logged skinned mesh materials to avoid spam
         private HashSet<string> loggedSkinnedMaterials = new HashSet<string>();
@@ -250,6 +254,8 @@ namespace UnityRemix
             meshesToCreate.Clear();
             meshesInQueue.Clear();
             loggedSkinnedMaterials.Clear();
+            skinnedRoundRobinIndex = 0;
+            persistentSkinnedData.Clear();
             logger.LogInfo("Renderer caches invalidated");
         }
         
@@ -260,6 +266,7 @@ namespace UnityRemix
         {
             cachedRenderers.Clear();
             cachedSkinnedRenderers.Clear();
+            skinnedRoundRobinIndex = 0;
             
             cachedRenderers.AddRange(UnityEngine.Object.FindObjectsOfType<MeshRenderer>());
             cachedSkinnedRenderers.AddRange(UnityEngine.Object.FindObjectsOfType<SkinnedMeshRenderer>());
@@ -511,13 +518,23 @@ namespace UnityRemix
             int baked = 0;
             int skipped = 0;
             
-            // Frame time budget for skinned mesh baking: max 5ms
+            // Frame time budget for skinned mesh baking
             var startTime = System.Diagnostics.Stopwatch.StartNew();
-            const float maxMilliseconds = 5.0f;
-            int maxSkinnedPerFrame = 20; // Limit skinned meshes per frame
+            const float maxMilliseconds = 8.0f;
             
-            foreach (var skinned in cachedSkinnedRenderers)
+            int total = cachedSkinnedRenderers.Count;
+            if (total == 0) return;
+            if (skinnedRoundRobinIndex >= total) skinnedRoundRobinIndex = 0;
+            int startIdx = skinnedRoundRobinIndex;
+            
+            // Track which skinned IDs are still valid this frame for pruning
+            var validSkinnedIds = new HashSet<int>();
+            bool timeBudgetExceeded = false;
+            
+            for (int iter = 0; iter < total; iter++)
             {
+                int idx = (startIdx + iter) % total;
+                var skinned = cachedSkinnedRenderers[idx];
                 if (skinned == null || !skinned.enabled || !skinned.gameObject.activeInHierarchy)
                 {
                     skipped++;
@@ -710,7 +727,8 @@ namespace UnityRemix
                         }
                     }
                     
-                    state.skinned.Add(new SkinnedMeshData
+                    // Store in persistent cache (drawn every frame, re-baked on round-robin)
+                    persistentSkinnedData[skinnedId] = new SkinnedMeshData
                     {
                         meshId = skinnedId,
                         materialId = matId,
@@ -719,12 +737,17 @@ namespace UnityRemix
                         uvs = uvCoords,
                         triangles = tris,
                         localToWorld = unscaledMatrix
-                    });
+                    };
+                    validSkinnedIds.Add(skinnedId);
                     baked++;
                     
-                    // Check budget - break if we've baked enough or exceeded time
-                    if (baked >= maxSkinnedPerFrame || startTime.Elapsed.TotalMilliseconds > maxMilliseconds)
+                    // Check time budget
+                    if (startTime.Elapsed.TotalMilliseconds > maxMilliseconds)
+                    {
+                        skinnedRoundRobinIndex = (idx + 1) % total;
+                        timeBudgetExceeded = true;
                         break;
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -733,10 +756,57 @@ namespace UnityRemix
                 }
             }
             
+            // For meshes we didn't visit (time budget hit), update transforms from cached renderers
+            if (timeBudgetExceeded)
+            {
+                for (int iter2 = 0; iter2 < total; iter2++)
+                {
+                    var sr = cachedSkinnedRenderers[iter2];
+                    if (sr == null) continue;
+                    int sid = sr.GetInstanceID();
+                    if (validSkinnedIds.Contains(sid)) continue; // already re-baked
+                    if (!persistentSkinnedData.TryGetValue(sid, out var cached)) continue;
+                    if (!sr.enabled || !sr.gameObject.activeInHierarchy)
+                    {
+                        persistentSkinnedData.Remove(sid);
+                        continue;
+                    }
+                    // Update transform so the stale mesh tracks position
+                    Vector3 ls = sr.transform.lossyScale;
+                    Matrix4x4 updatedMatrix = Matrix4x4.TRS(
+                        sr.transform.position,
+                        sr.transform.rotation,
+                        new Vector3(Mathf.Sign(ls.x), Mathf.Sign(ls.y), Mathf.Sign(ls.z))
+                    );
+                    cached.localToWorld = updatedMatrix;
+                    persistentSkinnedData[sid] = cached;
+                    validSkinnedIds.Add(sid);
+                }
+            }
+            
+            // Prune persistent entries for destroyed/disabled renderers
+            if (state.frameCount % 120 == 0)
+            {
+                var staleIds = new List<int>();
+                foreach (var id in persistentSkinnedData.Keys)
+                {
+                    if (!validSkinnedIds.Contains(id))
+                        staleIds.Add(id);
+                }
+                foreach (var id in staleIds)
+                    persistentSkinnedData.Remove(id);
+            }
+            
+            // Submit ALL persistent entries to the frame state
+            foreach (var entry in persistentSkinnedData.Values)
+            {
+                state.skinned.Add(entry);
+            }
+            
             // Log results periodically (controlled by debug log interval)
             if (doLog && cachedSkinnedRenderers.Count > 0)
             {
-                logger.LogInfo($"CaptureSkinnedMeshes: baked={baked}, skipped={skipped}, total={cachedSkinnedRenderers.Count}");
+                logger.LogInfo($"CaptureSkinnedMeshes: baked={baked}, skipped={skipped}, cached={persistentSkinnedData.Count}, total={cachedSkinnedRenderers.Count}");
             }
         }
         

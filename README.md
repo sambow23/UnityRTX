@@ -36,7 +36,7 @@ Edit `BepInEx/config/com.Unity.remix.cfg`:
 Requirements: Visual Studio 2019+, .NET Framework 4.7.2+, BepInEx installed to a game, a Unity 2019+ Mono game
 
 ```bash
-# Setup references (edit paths in setup-references.ps1)
+# Setup references
 .\setup-references.ps1 -UnityPath "F:\Program Files (x86)\Steam\steamapps\common\ULTRAKILL"
 
 # Build

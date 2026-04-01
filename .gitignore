@@ -67,3 +67,5 @@ lib/
 
 # Auto-generated build info
 BuildInfo.cs
+
+BepInEx/

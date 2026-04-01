@@ -37,9 +37,20 @@ namespace UnityRemix
         // Cache for texture hashes - maps Unity texture instance ID to XXH64 hash
         private Dictionary<int, ulong> textureHashCache = new Dictionary<int, ulong>();
         
+        // Track which textures have meaningful alpha (not all-opaque)
+        private HashSet<int> texturesWithAlpha = new HashSet<int>();
+        
         // Cache for materials - maps Unity material instance ID to Remix material handle
         private Dictionary<int, IntPtr> materialCache = new Dictionary<int, IntPtr>();
         
+        // Alpha handling modes detected from Unity materials
+        public enum AlphaMode
+        {
+            Opaque,     // No alpha
+            Cutout,     // Alpha test (discard below threshold)
+            Blend       // Alpha blending (fade/transparent)
+        }
+
         // Material data captured from Unity materials
         public struct MaterialTextureData
         {
@@ -50,6 +61,11 @@ namespace UnityRemix
             public Color albedoColor;
             public string materialName;
             public IntPtr remixMaterialHandle;
+            public AlphaMode alphaMode;
+            public float alphaCutoff; // 0-1, used for Cutout mode
+            public byte wrapModeU;    // MDL WrapMode: 0=Clamp, 1=Repeat, 2=MirroredRepeat, 3=Clip
+            public byte wrapModeV;
+            public byte filterMode;   // MDL Filter: 0=Nearest, 1=Linear
         }
         private Dictionary<int, MaterialTextureData> materialTextureData = new Dictionary<int, MaterialTextureData>();
         
@@ -187,7 +203,12 @@ namespace UnityRemix
                 normalHandle = IntPtr.Zero,
                 albedoTextureHash = 0,
                 normalTextureHash = 0,
-                remixMaterialHandle = IntPtr.Zero
+                remixMaterialHandle = IntPtr.Zero,
+                alphaMode = AlphaMode.Opaque,
+                alphaCutoff = 0.5f,
+                wrapModeU = 1, // MDL Repeat
+                wrapModeV = 1,
+                filterMode = 1 // MDL Linear
             };
             
             // Get albedo color
@@ -196,12 +217,31 @@ namespace UnityRemix
                 matData.albedoColor = material.GetColor("_Color");
             }
             
+            // Detect alpha mode from shader keywords, _Mode property, and render queue
+            var (detectedMode, detectionReason) = DetectAlphaModeWithReason(material);
+            matData.alphaMode = detectedMode;
+            if (material.HasProperty("_Cutoff"))
+            {
+                matData.alphaCutoff = material.GetFloat("_Cutoff");
+            }
+            
+            // Detailed diagnostic log for every material
+            logger.LogInfo($"[MaterialDiag] '{material.name}' shader='{material.shader?.name}' queue={material.renderQueue} " +
+                $"alphaMode={matData.alphaMode} reason={detectionReason} " +
+                $"color=({matData.albedoColor.r:F3},{matData.albedoColor.g:F3},{matData.albedoColor.b:F3},{matData.albedoColor.a:F3}) " +
+                $"cutoff={matData.alphaCutoff:F3}");
+            
             // Upload albedo texture
             if (captureTextures.Value && material.HasProperty("_MainTex"))
             {
                 var tex = material.GetTexture("_MainTex") as Texture2D;
                 if (tex != null)
                 {
+                    // Read Unity wrap/filter modes from texture and convert to MDL values
+                    matData.wrapModeU = UnityWrapToMdl(tex.wrapModeU);
+                    matData.wrapModeV = UnityWrapToMdl(tex.wrapModeV);
+                    matData.filterMode = (byte)(tex.filterMode == FilterMode.Point ? 0 : 1);
+                    
                     matData.albedoHandle = UploadUnityTexture(tex, srgb: true);
                     if (matData.albedoHandle != IntPtr.Zero)
                     {
@@ -210,7 +250,15 @@ namespace UnityRemix
                         {
                             matData.albedoTextureHash = hash;
                         }
-                        //logger.LogInfo($"Captured albedo texture for material '{material.name}' (hash: 0x{matData.albedoTextureHash:X16})");
+                        
+                        // Fallback: if shader metadata says Opaque but the texture has alpha, upgrade to Cutout
+                        if (matData.alphaMode == AlphaMode.Opaque && texturesWithAlpha.Contains(texId))
+                        {
+                            matData.alphaMode = AlphaMode.Cutout;
+                            if (!material.HasProperty("_Cutoff"))
+                                matData.alphaCutoff = 0.5f;
+                            logger.LogInfo($"[AlphaFallback] '{material.name}': texture has alpha content, upgrading Opaque -> Cutout (cutoff={matData.alphaCutoff:F2})");
+                        }
                     }
                 }
             }
@@ -345,12 +393,35 @@ namespace UnityRemix
                     }
                 }
                 
+                // Check alpha channel content for uncompressed RGBA formats
+                bool hasAlpha = false;
+                if (format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_SRGB ||
+                    format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM)
+                {
+                    hasAlpha = SampleAlphaRGBA(pixelData, alphaOffset: 3, stride: 4);
+                }
+                else if (format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_B8G8R8A8_SRGB ||
+                         format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_B8G8R8A8_UNORM)
+                {
+                    hasAlpha = SampleAlphaRGBA(pixelData, alphaOffset: 3, stride: 4);
+                }
+                else if (format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_SRGB ||
+                         format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_UNORM)
+                {
+                    // DXT5/BC3 has a full alpha channel — assume it's used
+                    hasAlpha = true;
+                }
+                // BC1 (DXT1) has only 1-bit punch-through alpha, treat as opaque
+                
+                if (hasAlpha)
+                    texturesWithAlpha.Add(texId);
+                
                 // Compute XXH64 hash
                 ulong textureHash = XXHash64.ComputeHash(hashSourceData, 0, hashSourceData.Length);
                 if (textureHash == 0) textureHash = 1;
                 
                 textureHashCache[texId] = textureHash;
-                logger.LogInfo($"Computed XXH64 hash for '{unityTexture.name}': 0x{textureHash:X16}");
+                logger.LogInfo($"Computed XXH64 hash for '{unityTexture.name}': 0x{textureHash:X16} hasAlpha={hasAlpha} fmt={unityTexture.format}");
                 
                 // Pin and upload
                 GCHandle pixelHandle = GCHandle.Alloc(pixelData, GCHandleType.Pinned);
@@ -487,6 +558,83 @@ namespace UnityRemix
             logger.LogInfo("Material creation thread stopped");
         }
         
+        /// <summary>
+        /// Convert Unity TextureWrapMode to MDL WrapMode (0=Clamp, 1=Repeat, 2=MirroredRepeat, 3=Clip).
+        /// </summary>
+        private static byte UnityWrapToMdl(TextureWrapMode mode)
+        {
+            switch (mode)
+            {
+                case TextureWrapMode.Repeat: return 1;
+                case TextureWrapMode.Clamp:  return 0;
+                case TextureWrapMode.Mirror: return 2;
+                default:                     return 1; // MirrorOnce and others → Repeat
+            }
+        }
+        
+        /// <summary>
+        /// Sample an uncompressed RGBA pixel buffer to check if the alpha channel has non-trivial content.
+        /// Checks a sparse grid of pixels for performance (avoids scanning entire textures).
+        /// </summary>
+        private static bool SampleAlphaRGBA(byte[] pixelData, int alphaOffset, int stride)
+        {
+            int pixelCount = pixelData.Length / stride;
+            if (pixelCount == 0) return false;
+            
+            // Sample up to 256 evenly-spaced pixels
+            int step = Math.Max(1, pixelCount / 256);
+            for (int i = 0; i < pixelCount; i += step)
+            {
+                int idx = i * stride + alphaOffset;
+                if (idx < pixelData.Length && pixelData[idx] < 250)
+                    return true;
+            }
+            return false;
+        }
+        
+        /// <summary>
+        /// Detect alpha mode from Unity material properties, shader keywords, and render queue.
+        /// Covers Standard shader (_Mode), URP/HDRP (_Surface), and keyword-based detection.
+        /// Returns (mode, reason) for diagnostic logging.
+        /// </summary>
+        private static (AlphaMode mode, string reason) DetectAlphaModeWithReason(Material material)
+        {
+            // 1. Shader keywords (most reliable, works across Standard/URP/HDRP/custom)
+            if (material.IsKeywordEnabled("_ALPHATEST_ON"))
+                return (AlphaMode.Cutout, "keyword:_ALPHATEST_ON");
+            if (material.IsKeywordEnabled("_ALPHABLEND_ON"))
+                return (AlphaMode.Blend, "keyword:_ALPHABLEND_ON");
+            if (material.IsKeywordEnabled("_ALPHAPREMULTIPLY_ON"))
+                return (AlphaMode.Blend, "keyword:_ALPHAPREMULTIPLY_ON");
+            
+            // 2. Standard shader _Mode property (0=Opaque, 1=Cutout, 2=Fade, 3=Transparent)
+            if (material.HasProperty("_Mode"))
+            {
+                int mode = (int)material.GetFloat("_Mode");
+                if (mode == 1) return (AlphaMode.Cutout, $"_Mode={mode}");
+                if (mode >= 2) return (AlphaMode.Blend, $"_Mode={mode}");
+            }
+            
+            // 3. URP/HDRP _Surface property (0=Opaque, 1=Transparent)
+            if (material.HasProperty("_Surface"))
+            {
+                int surface = (int)material.GetFloat("_Surface");
+                if (surface == 1)
+                {
+                    if (material.HasProperty("_AlphaClip") && material.GetFloat("_AlphaClip") > 0.5f)
+                        return (AlphaMode.Cutout, $"_Surface=1,_AlphaClip=1");
+                    return (AlphaMode.Blend, $"_Surface=1");
+                }
+            }
+            
+            // 4. Render queue heuristic (fallback)
+            int queue = material.renderQueue;
+            if (queue >= 2450 && queue < 3000) return (AlphaMode.Cutout, $"renderQueue={queue}");
+            if (queue >= 3000) return (AlphaMode.Blend, $"renderQueue={queue}");
+            
+            return (AlphaMode.Opaque, "default");
+        }
+        
         private IntPtr CreateRemixMaterialSimple(ref MaterialTextureData matData, int materialId)
         {
             if (createMaterialFunc == null)
@@ -506,42 +654,106 @@ namespace UnityRemix
                         albedoPath = DebugTextureHashPath;
                 }
 
-                logger.LogInfo($"Creating material '{matData.materialName}': albedo={albedoPath ?? "none"}, normal={normalPath ?? "none"}");
+                logger.LogInfo($"[MaterialCreate] '{matData.materialName}': albedo={albedoPath ?? "none"}, normal={normalPath ?? "none"}, alphaMode={matData.alphaMode}");
                 
-                var materialInfo = new RemixAPI.remixapi_MaterialInfo
+                // Build the OpaqueEXT using the blittable Raw struct for safe pNext chaining
+                var opaqueExt = new RemixAPI.remixapi_MaterialInfoOpaqueEXT_Raw
                 {
-                    sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_MATERIAL_INFO,
+                    sType = (int)RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT,
                     pNext = IntPtr.Zero,
-                    hash = matHash,
-                    albedoTexture = albedoPath,
-                    normalTexture = normalPath,
-                    tangentTexture = null,
-                    emissiveTexture = null,
-                    emissiveIntensity = 0.0f,
-                    emissiveColorConstant = new RemixAPI.remixapi_Float3D { x = 0, y = 0, z = 0 },
-                    spriteSheetRow = 1,
-                    spriteSheetCol = 1,
-                    spriteSheetFps = 0,
-                    filterMode = 0,
-                    wrapModeU = 0,
-                    wrapModeV = 0
+                    roughnessTexture = IntPtr.Zero,
+                    metallicTexture = IntPtr.Zero,
+                    anisotropy = 0.0f,
+                    albedoConstant_x = matData.albedoColor.r,
+                    albedoConstant_y = matData.albedoColor.g,
+                    albedoConstant_z = matData.albedoColor.b,
+                    opacityConstant = matData.albedoColor.a,
+                    roughnessConstant = 0.5f,
+                    metallicConstant = 0.0f,
+                    thinFilmThickness_hasvalue = 0,
+                    thinFilmThickness_value = 0.0f,
+                    alphaIsThinFilmThickness = 0,
+                    heightTexture = IntPtr.Zero,
+                    displaceIn = 0.0f,
+                    useDrawCallAlphaState = 0,
+                    blendType_hasvalue = 0,
+                    blendType_value = 0,
+                    invertedBlend = 0,
+                    // VkCompareOp: 0=NEVER, 6=GREATER_OR_EQUAL, 7=ALWAYS
+                    alphaTestType = 7, // kAlways — default: pass all pixels (no alpha test)
+                    alphaReferenceValue = 0,
+                    displaceOut = 0.0f
                 };
                 
-                IntPtr materialHandle;
-                RemixAPI.remixapi_ErrorCode result;
-                lock (apiLock)
+                // Configure alpha based on detected mode
+                switch (matData.alphaMode)
                 {
-                    result = createMaterialFunc(ref materialInfo, out materialHandle);
+                    case AlphaMode.Cutout:
+                        // VkCompareOp 6 = GREATER_OR_EQUAL: pass pixels with alpha >= reference
+                        opaqueExt.alphaTestType = 6;
+                        opaqueExt.alphaReferenceValue = (byte)(Mathf.Clamp01(matData.alphaCutoff) * 255f);
+                        break;
+                    case AlphaMode.Blend:
+                        // Enable alpha blending (kAlpha = 0)
+                        opaqueExt.blendType_hasvalue = 1; // remixapi_Bool.True
+                        opaqueExt.blendType_value = 0;    // kAlpha
+                        break;
                 }
                 
-                if (result != RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
-                {
-                    logger.LogError($"Failed to create Remix material for '{matData.materialName}': {result}");
-                    return IntPtr.Zero;
-                }
+                // Log all OpaqueEXT values being sent to Remix
+                logger.LogInfo($"[OpaqueEXT] '{matData.materialName}': " +
+                    $"sType={opaqueExt.sType} " +
+                    $"albedo=({opaqueExt.albedoConstant_x:F3},{opaqueExt.albedoConstant_y:F3},{opaqueExt.albedoConstant_z:F3}) " +
+                    $"opacity={opaqueExt.opacityConstant:F3} " +
+                    $"roughness={opaqueExt.roughnessConstant:F3} metallic={opaqueExt.metallicConstant:F3} " +
+                    $"alphaTestType={opaqueExt.alphaTestType} alphaRef={opaqueExt.alphaReferenceValue} " +
+                    $"blendHasValue={opaqueExt.blendType_hasvalue} blendValue={opaqueExt.blendType_value} " +
+                    $"invertedBlend={opaqueExt.invertedBlend} useDrawCallAlpha={opaqueExt.useDrawCallAlphaState} " +
+                    $"structSize={System.Runtime.InteropServices.Marshal.SizeOf<RemixAPI.remixapi_MaterialInfoOpaqueEXT_Raw>()}");
                 
-                logger.LogInfo($"Created Remix material '{matData.materialName}' with hash 0x{matHash:X}, handle: 0x{materialHandle.ToInt64():X}");
-                return materialHandle;
+                GCHandle opaqueHandle = GCHandle.Alloc(opaqueExt, GCHandleType.Pinned);
+                
+                try
+                {
+                    var materialInfo = new RemixAPI.remixapi_MaterialInfo
+                    {
+                        sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_MATERIAL_INFO,
+                        pNext = opaqueHandle.AddrOfPinnedObject(),
+                        hash = matHash,
+                        albedoTexture = albedoPath,
+                        normalTexture = normalPath,
+                        tangentTexture = null,
+                        emissiveTexture = null,
+                        emissiveIntensity = 0.0f,
+                        emissiveColorConstant = new RemixAPI.remixapi_Float3D { x = 0, y = 0, z = 0 },
+                        spriteSheetRow = 1,
+                        spriteSheetCol = 1,
+                        spriteSheetFps = 0,
+                        filterMode = matData.filterMode,
+                        wrapModeU = matData.wrapModeU,
+                        wrapModeV = matData.wrapModeV
+                    };
+                    
+                    IntPtr materialHandle;
+                    RemixAPI.remixapi_ErrorCode result;
+                    lock (apiLock)
+                    {
+                        result = createMaterialFunc(ref materialInfo, out materialHandle);
+                    }
+                    
+                    if (result != RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
+                    {
+                        logger.LogError($"Failed to create Remix material for '{matData.materialName}': {result}");
+                        return IntPtr.Zero;
+                    }
+                    
+                    logger.LogInfo($"Created Remix material '{matData.materialName}' with hash 0x{matHash:X}, handle: 0x{materialHandle.ToInt64():X}");
+                    return materialHandle;
+                }
+                finally
+                {
+                    opaqueHandle.Free();
+                }
             }
             catch (Exception ex)
             {

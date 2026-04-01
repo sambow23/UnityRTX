@@ -404,6 +404,40 @@ namespace UnityRemix
             public float displaceOut;
         }
 
+        /// <summary>
+        /// Blittable version of OpaqueEXT for direct unsafe pNext chaining.
+        /// Uses IntPtr instead of LPWStr strings to avoid Mono StructureToPtr issues.
+        /// Layout must match remixapi_MaterialInfoOpaqueEXT exactly (112 bytes on x64).
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct remixapi_MaterialInfoOpaqueEXT_Raw
+        {
+            public int sType;            // remixapi_StructType
+            public IntPtr pNext;
+            public IntPtr roughnessTexture; // null = no texture
+            public IntPtr metallicTexture;  // null = no texture
+            public float anisotropy;
+            public float albedoConstant_x;
+            public float albedoConstant_y;
+            public float albedoConstant_z;
+            public float opacityConstant;
+            public float roughnessConstant;
+            public float metallicConstant;
+            public int thinFilmThickness_hasvalue; // remixapi_Bool (uint32)
+            public float thinFilmThickness_value;
+            public int alphaIsThinFilmThickness;   // remixapi_Bool (uint32)
+            public IntPtr heightTexture;   // null = no texture
+            public float displaceIn;
+            public int useDrawCallAlphaState;       // remixapi_Bool (uint32)
+            public int blendType_hasvalue;          // remixapi_Bool (uint32)
+            public int blendType_value;
+            public int invertedBlend;               // remixapi_Bool (uint32)
+            public int alphaTestType;
+            public byte alphaReferenceValue;
+            // 3 bytes implicit padding (C# Sequential matches C struct packing)
+            public float displaceOut;
+        }
+
         #endregion
 
         #region Function Pointer Delegates

@@ -26,6 +26,7 @@ namespace UnityRemix
         private readonly ConfigEntry<int> configDebugLogInterval;
         private readonly ConfigEntry<bool> configCaptureStaticMeshes;
         private readonly ConfigEntry<bool> configCaptureSkinnedMeshes;
+        private readonly ConfigEntry<bool> configHardwareSkinning;
         
         // Renderer caching
         private List<MeshRenderer> cachedRenderers = new List<MeshRenderer>();
@@ -281,7 +282,8 @@ namespace UnityRemix
             ConfigEntry<int> rendererCacheDuration,
             ConfigEntry<int> debugLogInterval,
             ConfigEntry<bool> captureStaticMeshes,
-            ConfigEntry<bool> captureSkinnedMeshes)
+            ConfigEntry<bool> captureSkinnedMeshes,
+            ConfigEntry<bool> hardwareSkinning)
         {
             this.logger = logger;
             this.cameraHandler = cameraHandler;
@@ -294,6 +296,7 @@ namespace UnityRemix
             this.configDebugLogInterval = debugLogInterval;
             this.configCaptureStaticMeshes = captureStaticMeshes;
             this.configCaptureSkinnedMeshes = captureSkinnedMeshes;
+            this.configHardwareSkinning = hardwareSkinning;
         }
         
         /// <summary>
@@ -631,10 +634,13 @@ namespace UnityRemix
                 int sharedMeshId = skinned.sharedMesh.GetInstanceID();
                 
                 // Try GPU skinning path: extract bone weights once, compute bone transforms each frame
-                if (!cachedSkinning.ContainsKey(sharedMeshId))
-                    CacheSkinningData(skinned, sharedMeshId);
-                
-                var skinData = cachedSkinning.TryGetValue(sharedMeshId, out var sd) ? sd : null;
+                var skinData = (CachedSkinningData)null;
+                if (configHardwareSkinning.Value)
+                {
+                    if (!cachedSkinning.ContainsKey(sharedMeshId))
+                        CacheSkinningData(skinned, sharedMeshId);
+                    skinData = cachedSkinning.TryGetValue(sharedMeshId, out var sd) ? sd : null;
+                }
                 if (skinData != null && skinned.bones != null && skinned.bones.Length > 0)
                 {
                     // Compute bone transforms for Remix GPU skinning

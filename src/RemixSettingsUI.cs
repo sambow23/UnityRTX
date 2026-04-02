@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics.CodeAnalysis;
 using BepInEx.Logging;
 
 namespace UnityRemix
@@ -23,6 +24,7 @@ namespace UnityRemix
         private bool _enableLights;
         private bool _captureStaticMeshes;
         private bool _captureSkinnedMeshes;
+        private bool _hardwareSkinning;
         private bool _captureTextures;
         private bool _captureMaterials;
         private bool _enableSceneScan;
@@ -266,10 +268,17 @@ namespace UnityRemix
             if (!RemixImGui.CollapsingHeader("Performance"))
                 return;
 
+            RemixImGui.Text("Used to lock the framerate of the wrapper itself, not the game.");
+
             if (RemixImGui.DragInt("Target FPS", ref _targetFPS, 1, 0, 500))
                 _plugin.SetConfig("TargetFPS", _targetFPS);
 
             RemixImGui.Text(_targetFPS == 0 ? "(Uncapped)" : "");
+
+            if (RemixImGui.Checkbox("Hardware Skinning", ref _hardwareSkinning))
+                _plugin.SetConfig("HardwareSkinning", _hardwareSkinning);
+
+            RemixImGui.Text("Requires scene reload to apply");
         }
 
         private void DrawDebugSection()
@@ -299,6 +308,7 @@ namespace UnityRemix
             _targetFPS = _plugin.GetConfigInt("TargetFPS");
             _captureStaticMeshes = _plugin.GetConfigBool("CaptureStaticMeshes");
             _captureSkinnedMeshes = _plugin.GetConfigBool("CaptureSkinnedMeshes");
+            _hardwareSkinning = _plugin.GetConfigBool("HardwareSkinning");
             _captureTextures = _plugin.GetConfigBool("CaptureTextures");
             _captureMaterials = _plugin.GetConfigBool("CaptureMaterials");
             _selectedCameraName = _plugin.GetConfigString("CameraName");

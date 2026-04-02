@@ -277,6 +277,15 @@ namespace UnityRemix
         }
 
         [StructLayout(LayoutKind.Sequential)]
+        public struct remixapi_InstanceInfoBoneTransformsEXT
+        {
+            public remixapi_StructType sType;
+            public IntPtr pNext;
+            public IntPtr boneTransforms_values;  // const remixapi_Transform*
+            public uint boneTransforms_count;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
         public struct remixapi_LightInfoSphereEXT
         {
             public remixapi_StructType sType;

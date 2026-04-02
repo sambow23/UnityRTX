@@ -94,6 +94,14 @@ namespace UnityRemix
         }
         
         /// <summary>
+        /// Get cached skinned mesh handle
+        /// </summary>
+        public bool TryGetSkinnedMeshHandle(int meshId, out IntPtr handle)
+        {
+            return skinnedMeshHandles.TryGetValue(meshId, out handle);
+        }
+        
+        /// <summary>
         /// Create and cache a Unity mesh in Remix format
         /// </summary>
         public IntPtr CreateRemixMeshFromUnity(Mesh mesh, Material material)
@@ -287,8 +295,8 @@ namespace UnityRemix
                 }
             }
             
-            // Unique hash per frame
-            ulong dynamicHash = ((ulong)meshId << 32) | (uint)frameHash;
+            // Stable hash per skinned renderer — lets Remix track the mesh across frames
+            ulong dynamicHash = (ulong)unchecked((uint)meshId);
             
             // Ensure normals
             if (normals == null || normals.Length != vertices.Length)
@@ -470,6 +478,218 @@ namespace UnityRemix
             finally
             {
                 pickingHandle.Free();
+            }
+        }
+        
+        /// <summary>
+        /// Create a Remix mesh with GPU skinning data (bind-pose vertices + bone weights).
+        /// Called once per unique sharedMesh. Returns mesh handle or IntPtr.Zero on failure.
+        /// </summary>
+        public IntPtr CreateSkinnedMeshWithBones(
+            int meshId,
+            Vector3[] vertices,
+            Vector3[] normals,
+            Vector2[] uvs,
+            int[] triangles,
+            float[] blendWeights,
+            uint[] blendIndices,
+            int bonesPerVertex,
+            int materialId)
+        {
+            if (vertices == null || vertices.Length == 0 || triangles == null || triangles.Length == 0)
+                return IntPtr.Zero;
+            
+            ulong meshHash = (ulong)unchecked((uint)meshId);
+            
+            if (normals == null || normals.Length != vertices.Length)
+            {
+                normals = new Vector3[vertices.Length];
+                for (int i = 0; i < normals.Length; i++)
+                    normals[i] = Vector3.up;
+            }
+            if (uvs == null || uvs.Length != vertices.Length)
+                uvs = new Vector2[vertices.Length];
+            
+            // Build vertex array (Y-up to Z-up)
+            var remixVerts = new RemixAPI.remixapi_HardcodedVertex[vertices.Length];
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                remixVerts[i] = RemixAPI.MakeVertex(
+                    vertices[i].x, vertices[i].z, vertices[i].y,
+                    normals[i].x, normals[i].z, normals[i].y,
+                    uvs[i].x, uvs[i].y,
+                    0xFFFFFFFF
+                );
+            }
+            
+            var indices = new uint[triangles.Length];
+            for (int i = 0; i < triangles.Length; i++)
+                indices[i] = (uint)triangles[i];
+            
+            // Pin all arrays
+            GCHandle vertHandle = GCHandle.Alloc(remixVerts, GCHandleType.Pinned);
+            GCHandle idxHandle = GCHandle.Alloc(indices, GCHandleType.Pinned);
+            GCHandle weightsHandle = GCHandle.Alloc(blendWeights, GCHandleType.Pinned);
+            GCHandle indicesHandle = GCHandle.Alloc(blendIndices, GCHandleType.Pinned);
+            
+            try
+            {
+                IntPtr materialHandle = IntPtr.Zero;
+                if (materialId != 0)
+                    materialHandle = materialManager.GetOrCreateMaterial(materialId);
+                
+                var skinning = new RemixAPI.remixapi_MeshInfoSkinning
+                {
+                    bonesPerVertex = (uint)bonesPerVertex,
+                    blendWeights_values = weightsHandle.AddrOfPinnedObject(),
+                    blendWeights_count = (uint)blendWeights.Length,
+                    blendIndices_values = indicesHandle.AddrOfPinnedObject(),
+                    blendIndices_count = (uint)blendIndices.Length
+                };
+                
+                var surface = new RemixAPI.remixapi_MeshInfoSurfaceTriangles
+                {
+                    vertices_values = vertHandle.AddrOfPinnedObject(),
+                    vertices_count = (ulong)vertices.Length,
+                    indices_values = idxHandle.AddrOfPinnedObject(),
+                    indices_count = (ulong)triangles.Length,
+                    skinning_hasvalue = 1,
+                    skinning_value = skinning,
+                    material = materialHandle
+                };
+                
+                GCHandle surfaceHandle = GCHandle.Alloc(surface, GCHandleType.Pinned);
+                try
+                {
+                    var meshInfo = new RemixAPI.remixapi_MeshInfo
+                    {
+                        sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_MESH_INFO,
+                        pNext = IntPtr.Zero,
+                        hash = meshHash,
+                        surfaces_values = surfaceHandle.AddrOfPinnedObject(),
+                        surfaces_count = 1
+                    };
+                    
+                    IntPtr handle;
+                    RemixAPI.remixapi_ErrorCode result;
+                    lock (apiLock)
+                    {
+                        result = createMeshFunc(ref meshInfo, out handle);
+                    }
+                    
+                    if (result != RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
+                    {
+                        logger.LogWarning($"CreateSkinnedMeshWithBones failed for {meshId}: {result}");
+                        return IntPtr.Zero;
+                    }
+                    
+                    return handle;
+                }
+                finally
+                {
+                    surfaceHandle.Free();
+                }
+            }
+            finally
+            {
+                vertHandle.Free();
+                idxHandle.Free();
+                weightsHandle.Free();
+                indicesHandle.Free();
+            }
+        }
+        
+        /// <summary>
+        /// Draw a GPU-skinned mesh instance with bone transforms via pNext chain.
+        /// </summary>
+        public unsafe void DrawSkinnedInstance(IntPtr meshHandle, Matrix4x4 localToWorld, Matrix4x4[] boneTransforms, uint objectPickingValue)
+        {
+            if (drawInstanceFunc == null || meshHandle == IntPtr.Zero || boneTransforms == null)
+                return;
+            
+            // Convert instance transform (Y-up to Z-up)
+            var m = localToWorld;
+            var transform = RemixAPI.remixapi_Transform.FromMatrix(
+                m.m00, m.m02, m.m01, m.m03,
+                m.m20, m.m22, m.m21, m.m23,
+                m.m10, m.m12, m.m11, m.m13
+            );
+            
+            // Convert bone transforms to Remix format (Y-up to Z-up, 3x4 matrices)
+            int boneCount = boneTransforms.Length;
+            var remixBones = new RemixAPI.remixapi_Transform[boneCount];
+            for (int i = 0; i < boneCount; i++)
+            {
+                var b = boneTransforms[i];
+                remixBones[i] = RemixAPI.remixapi_Transform.FromMatrix(
+                    b.m00, b.m02, b.m01, b.m03,
+                    b.m20, b.m22, b.m21, b.m23,
+                    b.m10, b.m12, b.m11, b.m13
+                );
+            }
+            
+            GCHandle bonesHandle = GCHandle.Alloc(remixBones, GCHandleType.Pinned);
+            
+            try
+            {
+                // Build pNext chain: InstanceInfo -> BoneTransforms -> ObjectPicking
+                var objectPickingExt = new RemixAPI.remixapi_InstanceInfoObjectPickingEXT
+                {
+                    sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_OBJECT_PICKING_EXT,
+                    pNext = IntPtr.Zero,
+                    objectPickingValue = objectPickingValue
+                };
+                
+                GCHandle pickingHandle = GCHandle.Alloc(objectPickingExt, GCHandleType.Pinned);
+                
+                try
+                {
+                    var boneExt = new RemixAPI.remixapi_InstanceInfoBoneTransformsEXT
+                    {
+                        sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT,
+                        pNext = pickingHandle.AddrOfPinnedObject(),
+                        boneTransforms_values = bonesHandle.AddrOfPinnedObject(),
+                        boneTransforms_count = (uint)boneCount
+                    };
+                    
+                    GCHandle boneExtHandle = GCHandle.Alloc(boneExt, GCHandleType.Pinned);
+                    
+                    try
+                    {
+                        var instanceInfo = new RemixAPI.remixapi_InstanceInfo
+                        {
+                            sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_INSTANCE_INFO,
+                            pNext = boneExtHandle.AddrOfPinnedObject(),
+                            categoryFlags = 0,
+                            mesh = meshHandle,
+                            transform = transform,
+                            doubleSided = 1
+                        };
+                        
+                        RemixAPI.remixapi_ErrorCode result;
+                        lock (apiLock)
+                        {
+                            result = drawInstanceFunc(ref instanceInfo);
+                        }
+                        
+                        if (result != RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
+                        {
+                            logger.LogWarning($"DrawSkinnedInstance failed for mesh 0x{meshHandle.ToInt64():X}: {result}");
+                        }
+                    }
+                    finally
+                    {
+                        boneExtHandle.Free();
+                    }
+                }
+                finally
+                {
+                    pickingHandle.Free();
+                }
+            }
+            finally
+            {
+                bonesHandle.Free();
             }
         }
         

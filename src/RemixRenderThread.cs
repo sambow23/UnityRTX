@@ -350,27 +350,60 @@ namespace UnityRemix
             {
                 try
                 {
-                    // Create mesh from baked data with material
-                    IntPtr meshHandle = meshConverter.CreateRemixMeshFromData(
-                        skinned.meshId,
-                        skinned.vertices,
-                        skinned.normals,
-                        skinned.uvs,
-                        skinned.triangles,
-                        state.frameCount,
-                        skinned.materialId
-                    );
-                    
-                    if (meshHandle == IntPtr.Zero)
-                        continue;
-                    
-                    meshConverter.UpdateSkinnedMeshHandle(skinned.meshId, meshHandle);
-                    updatedMeshes.Add(skinned.meshId);
-                    
-                    // Draw instance
-                    //logger.LogInfo($"Drawing skinned mesh {skinned.meshId}: meshHandle=0x{meshHandle.ToInt64():X}, materialId={skinned.materialId}");
-                    meshConverter.DrawMeshInstance(meshHandle, skinned.localToWorld, objectPickingValue);
-                    objectPickingValue++;
+                    if (skinned.skinningData != null && skinned.boneTransforms != null)
+                    {
+                        // GPU skinning path: create mesh once with bone weights, draw with bone transforms each frame
+                        IntPtr meshHandle;
+                        if (!skinned.skinningData.meshCreated)
+                        {
+                            meshHandle = meshConverter.CreateSkinnedMeshWithBones(
+                                skinned.meshId,
+                                skinned.vertices,
+                                skinned.normals,
+                                skinned.uvs,
+                                skinned.triangles,
+                                skinned.skinningData.blendWeights,
+                                skinned.skinningData.blendIndices,
+                                skinned.skinningData.bonesPerVertex,
+                                skinned.materialId
+                            );
+                            
+                            if (meshHandle == IntPtr.Zero)
+                                continue;
+                            
+                            meshConverter.UpdateSkinnedMeshHandle(skinned.meshId, meshHandle);
+                            skinned.skinningData.meshCreated = true;
+                        }
+                        else if (!meshConverter.TryGetSkinnedMeshHandle(skinned.meshId, out meshHandle) || meshHandle == IntPtr.Zero)
+                        {
+                            continue;
+                        }
+                        
+                        updatedMeshes.Add(skinned.meshId);
+                        meshConverter.DrawSkinnedInstance(meshHandle, skinned.localToWorld, skinned.boneTransforms, objectPickingValue);
+                        objectPickingValue++;
+                    }
+                    else
+                    {
+                        // BakeMesh fallback: recreate mesh each frame with new vertex data
+                        IntPtr meshHandle = meshConverter.CreateRemixMeshFromData(
+                            skinned.meshId,
+                            skinned.vertices,
+                            skinned.normals,
+                            skinned.uvs,
+                            skinned.triangles,
+                            state.frameCount,
+                            skinned.materialId
+                        );
+                        
+                        if (meshHandle == IntPtr.Zero)
+                            continue;
+                        
+                        meshConverter.UpdateSkinnedMeshHandle(skinned.meshId, meshHandle);
+                        updatedMeshes.Add(skinned.meshId);
+                        meshConverter.DrawMeshInstance(meshHandle, skinned.localToWorld, objectPickingValue);
+                        objectPickingValue++;
+                    }
                 }
                 catch { }
             }

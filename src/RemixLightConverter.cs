@@ -97,7 +97,9 @@ namespace UnityRemix
             if (!configEnableLights.Value || drawLightInstanceFunc == null || createLightFunc == null)
                 return;
             
-            foreach (var light in cachedLights)
+            // Snapshot to avoid collection-modified if RefreshLightCache runs on main thread
+            var lightsSnapshot = cachedLights.ToArray();
+            foreach (var light in lightsSnapshot)
             {
                 if (light == null || !light.enabled || !light.gameObject.activeInHierarchy)
                     continue;

@@ -16,6 +16,7 @@ namespace UnityRemix
         private readonly TextureCategoryManager textureCategoryManager;
         private readonly BepInEx.Configuration.ConfigEntry<bool> captureTextures;
         private readonly BepInEx.Configuration.ConfigEntry<bool> captureMaterials;
+        private readonly BepInEx.Configuration.ConfigEntry<bool> verboseTextureLogging;
         private readonly object apiLock;
         
         // Cached delegates
@@ -42,6 +43,9 @@ namespace UnityRemix
         
         // Cache for materials - maps Unity material instance ID to Remix material handle
         private Dictionary<int, IntPtr> materialCache = new Dictionary<int, IntPtr>();
+        
+        // Cache for tinted emissive textures - maps (texId ^ tintColorKey) to (handle, hash)
+        private Dictionary<long, (IntPtr handle, ulong hash)> tintedTextureCache = new Dictionary<long, (IntPtr, ulong)>();
         
         // Alpha handling modes detected from Unity materials
         public enum AlphaMode
@@ -86,6 +90,7 @@ namespace UnityRemix
             TextureCategoryManager categoryManager,
             BepInEx.Configuration.ConfigEntry<bool> captureTextures,
             BepInEx.Configuration.ConfigEntry<bool> captureMaterials,
+            BepInEx.Configuration.ConfigEntry<bool> verboseTextureLogging,
             RemixAPI.remixapi_Interface remixInterface,
             object apiLock)
         {
@@ -93,6 +98,7 @@ namespace UnityRemix
             this.textureCategoryManager = categoryManager;
             this.captureTextures = captureTextures;
             this.captureMaterials = captureMaterials;
+            this.verboseTextureLogging = verboseTextureLogging;
             this.apiLock = apiLock;
             
             // Cache delegates
@@ -175,7 +181,8 @@ namespace UnityRemix
             if (result == RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
             {
                 textureCategoryManager.SetTextureCategory(textureHash, categoryName);
-                logger.LogInfo($"Registered texture 0x{textureHash:X16} to category '{categoryName}'");
+                if (verboseTextureLogging.Value)
+                    logger.LogInfo($"Registered texture 0x{textureHash:X16} to category '{categoryName}'");
             }
             else
             {
@@ -184,9 +191,9 @@ namespace UnityRemix
         }
         
         /// <summary>
-        /// Capture textures from a Unity material
+        /// Capture textures from a Unity material, with optional per-renderer property overrides
         /// </summary>
-        public void CaptureMaterialTextures(Material material, int materialId)
+        public void CaptureMaterialTextures(Material material, int materialId, Color? mpbEmissiveColor = null, float? mpbEmissiveIntensity = null)
         {
             if (material == null)
                 return;
@@ -257,15 +264,18 @@ namespace UnityRemix
             }
             
             // Detailed diagnostic log for every material
-            logger.LogInfo($"[MaterialDiag] '{material.name}' shader='{material.shader?.name}' queue={material.renderQueue} " +
-                $"alphaMode={matData.alphaMode} reason={detectionReason} " +
-                $"color=({matData.albedoColor.r:F3},{matData.albedoColor.g:F3},{matData.albedoColor.b:F3},{matData.albedoColor.a:F3}) " +
-                $"cutoff={matData.alphaCutoff:F3}");
+            if (verboseTextureLogging.Value)
+                logger.LogInfo($"[MaterialDiag] '{material.name}' shader='{material.shader?.name}' queue={material.renderQueue} " +
+                    $"alphaMode={matData.alphaMode} reason={detectionReason} " +
+                    $"color=({matData.albedoColor.r:F3},{matData.albedoColor.g:F3},{matData.albedoColor.b:F3},{matData.albedoColor.a:F3}) " +
+                    $"cutoff={matData.alphaCutoff:F3}");
             
             // Upload albedo texture
+            Texture2D albedoTex = null;
             if (captureTextures.Value && material.HasProperty("_MainTex"))
             {
                 var tex = material.GetTexture("_MainTex") as Texture2D;
+                albedoTex = tex;
                 if (tex != null)
                 {
                     // Read Unity wrap/filter modes from texture and convert to MDL values
@@ -288,7 +298,8 @@ namespace UnityRemix
                             matData.alphaMode = AlphaMode.Cutout;
                             if (!material.HasProperty("_Cutoff"))
                                 matData.alphaCutoff = 0.5f;
-                            logger.LogInfo($"[AlphaFallback] '{material.name}': texture has alpha content, upgrading Opaque -> Cutout (cutoff={matData.alphaCutoff:F2})");
+                            if (verboseTextureLogging.Value)
+                                logger.LogInfo($"[AlphaFallback] '{material.name}': texture has alpha content, upgrading Opaque -> Cutout (cutoff={matData.alphaCutoff:F2})");
                         }
                     }
                 }
@@ -308,7 +319,8 @@ namespace UnityRemix
                     var pType = material.shader.GetPropertyType(p);
                     sb.Append($"{pName}({pType}) ");
                 }
-                logger.LogInfo(sb.ToString());
+                if (verboseTextureLogging.Value)
+                    logger.LogInfo(sb.ToString());
             }
             
             // Upload emission — support both Standard (_EmissionColor/_EmissionMap/_EMISSION keyword)
@@ -323,27 +335,26 @@ namespace UnityRemix
                     {
                         matData.emissiveColor = material.GetColor("_EmissionColor");
                         float maxChannel = Mathf.Max(matData.emissiveColor.r, Mathf.Max(matData.emissiveColor.g, matData.emissiveColor.b));
-                        matData.emissiveIntensity = maxChannel;
+                        // Store 1.0 as intensity — CreateRemixMaterialSimple already folds maxChannel into
+                        // emCombinedIntensity (= maxCh * emissiveIntensity), so storing maxChannel here
+                        // would double it. The HDR brightness lives in the color, not the intensity.
+                        matData.emissiveIntensity = maxChannel > 0f ? 1.0f : 0f;
                     }
                     if (material.HasProperty("_EmissionMap"))
                     {
                         var emTex = material.GetTexture("_EmissionMap") as Texture2D;
                         if (emTex != null)
                         {
-                            matData.emissiveHandle = UploadUnityTexture(emTex, srgb: true);
-                            if (matData.emissiveHandle != IntPtr.Zero)
-                            {
-                                int texId = emTex.GetInstanceID();
-                                if (textureHashCache.TryGetValue(texId, out ulong hash))
-                                    matData.emissiveTextureHash = hash;
-                            }
+                            var (emHandle, emHash) = UploadTintedEmissiveTexture(emTex, matData.emissiveColor);
+                            matData.emissiveHandle = emHandle;
+                            matData.emissiveTextureHash = emHash;
                         }
                     }
                     hasEmission = matData.emissiveIntensity > 0f || matData.emissiveHandle != IntPtr.Zero;
                 }
                 
                 // ULTRAKILL/custom shader path: _EmissiveColor, _EmissiveTex, _EmissiveIntensity
-                // Only emit if: toggle is on, OR a dedicated emission texture is assigned
+                // Only emit if: toggle is on, OR a dedicated emission texture is assigned, OR MPB override is present
                 if (!hasEmission && material.HasProperty("_EmissiveColor"))
                 {
                     bool emissiveToggle = true;
@@ -355,11 +366,16 @@ namespace UnityRemix
                     if (material.HasProperty("_EmissiveTex"))
                         hasEmissiveTex = material.GetTexture("_EmissiveTex") != null;
                     
-                    if (emissiveToggle || hasEmissiveTex)
+                    // MPB color override also triggers emission
+                    bool hasMpbOverride = mpbEmissiveColor.HasValue;
+                    
+                    if (emissiveToggle || hasEmissiveTex || hasMpbOverride)
                     {
-                        matData.emissiveColor = material.GetColor("_EmissiveColor");
+                        matData.emissiveColor = mpbEmissiveColor ?? material.GetColor("_EmissiveColor");
                         
-                        if (material.HasProperty("_EmissiveIntensity"))
+                        if (mpbEmissiveIntensity.HasValue)
+                            matData.emissiveIntensity = mpbEmissiveIntensity.Value;
+                        else if (material.HasProperty("_EmissiveIntensity"))
                             matData.emissiveIntensity = material.GetFloat("_EmissiveIntensity");
                         else
                         {
@@ -367,19 +383,15 @@ namespace UnityRemix
                             matData.emissiveIntensity = maxCh;
                         }
                         
-                        // Upload _EmissiveTex if present
+                        // Upload _EmissiveTex if present, pre-tinted by emission color
                         if (hasEmissiveTex)
                         {
                             var emTex = material.GetTexture("_EmissiveTex") as Texture2D;
                             if (emTex != null)
                             {
-                                matData.emissiveHandle = UploadUnityTexture(emTex, srgb: true);
-                                if (matData.emissiveHandle != IntPtr.Zero)
-                                {
-                                    int texId = emTex.GetInstanceID();
-                                    if (textureHashCache.TryGetValue(texId, out ulong hash))
-                                        matData.emissiveTextureHash = hash;
-                                }
+                                var (emHandle, emHash) = UploadTintedEmissiveTexture(emTex, matData.emissiveColor);
+                                matData.emissiveHandle = emHandle;
+                                matData.emissiveTextureHash = emHash;
                             }
                         }
                         
@@ -389,8 +401,17 @@ namespace UnityRemix
                             && material.GetFloat("_UseAlbedoAsEmissive") > 0.5f
                             && matData.albedoHandle != IntPtr.Zero)
                         {
-                            matData.emissiveHandle = matData.albedoHandle;
-                            matData.emissiveTextureHash = matData.albedoTextureHash;
+                            if (albedoTex != null)
+                            {
+                                var (emHandle, emHash) = UploadTintedEmissiveTexture(albedoTex, matData.emissiveColor);
+                                matData.emissiveHandle = emHandle;
+                                matData.emissiveTextureHash = emHash;
+                            }
+                            else
+                            {
+                                matData.emissiveHandle = matData.albedoHandle;
+                                matData.emissiveTextureHash = matData.albedoTextureHash;
+                            }
                         }
                         
                         hasEmission = matData.emissiveIntensity > 0f && matData.emissiveHandle != IntPtr.Zero;
@@ -399,8 +420,9 @@ namespace UnityRemix
                 
                 if (hasEmission)
                 {
-                    logger.LogInfo($"[Emission] '{material.name}': color=({matData.emissiveColor.r:F3},{matData.emissiveColor.g:F3},{matData.emissiveColor.b:F3}) " +
-                        $"intensity={matData.emissiveIntensity:F3} texHash=0x{matData.emissiveTextureHash:X16}");
+                    if (verboseTextureLogging.Value)
+                        logger.LogInfo($"[Emission] '{material.name}': color=({matData.emissiveColor.r:F3},{matData.emissiveColor.g:F3},{matData.emissiveColor.b:F3}) " +
+                            $"intensity={matData.emissiveIntensity:F3} texHash=0x{matData.emissiveTextureHash:X16}");
                 }
             }
             
@@ -418,7 +440,8 @@ namespace UnityRemix
                         {
                             matData.normalTextureHash = hash;
                         }
-                        logger.LogInfo($"Captured normal texture for material '{material.name}' (hash: 0x{matData.normalTextureHash:X16})");
+                        if (verboseTextureLogging.Value)
+                            logger.LogInfo($"Captured normal texture for material '{material.name}' (hash: 0x{matData.normalTextureHash:X16})");
                     }
                 }
             }
@@ -462,7 +485,8 @@ namespace UnityRemix
                 // Handle non-readable textures via GPU readback
                 if (!unityTexture.isReadable)
                 {
-                    logger.LogInfo($"Texture '{unityTexture.name}' is not readable - forcing GPU readback");
+                    if (verboseTextureLogging.Value)
+                        logger.LogInfo($"Texture '{unityTexture.name}' is not readable - forcing GPU readback");
                     
                     RenderTextureReadWrite colorSpace = srgb ? RenderTextureReadWrite.sRGB : RenderTextureReadWrite.Linear;
                     RenderTexture tmp = RenderTexture.GetTemporary(
@@ -562,7 +586,8 @@ namespace UnityRemix
                 if (textureHash == 0) textureHash = 1;
                 
                 textureHashCache[texId] = textureHash;
-                logger.LogInfo($"Computed XXH64 hash for '{unityTexture.name}': 0x{textureHash:X16} hasAlpha={hasAlpha} fmt={unityTexture.format}");
+                if (verboseTextureLogging.Value)
+                    logger.LogInfo($"Computed XXH64 hash for '{unityTexture.name}': 0x{textureHash:X16} hasAlpha={hasAlpha} fmt={unityTexture.format}");
                 
                 // Pin and upload
                 GCHandle pixelHandle = GCHandle.Alloc(pixelData, GCHandleType.Pinned);
@@ -597,7 +622,8 @@ namespace UnityRemix
                     }
                     
                     textureCache[texId] = textureHandle;
-                    logger.LogInfo($"Successfully uploaded texture '{unityTexture.name}' with handle: 0x{textureHandle.ToInt64():X}");
+                    if (verboseTextureLogging.Value)
+                        logger.LogInfo($"Successfully uploaded texture '{unityTexture.name}' with handle: 0x{textureHandle.ToInt64():X}");
                     
                     return textureHandle;
                 }
@@ -610,6 +636,128 @@ namespace UnityRemix
             {
                 logger.LogError($"Exception uploading texture '{unityTexture.name}': {ex.Message}");
                 return IntPtr.Zero;
+            }
+        }
+        
+        /// <summary>
+        /// Upload an emissive texture pre-tinted by the emission color.
+        /// Remix's shader ignores emissiveColorConstant when a texture is present,
+        /// so we bake the color multiplication into the texture pixels.
+        /// Returns (handle, hash) for the uploaded texture.
+        /// </summary>
+        private (IntPtr handle, ulong hash) UploadTintedEmissiveTexture(Texture2D tex, Color emissiveColor, bool srgb = true)
+        {
+            if (tex == null || createTextureFunc == null)
+                return (IntPtr.Zero, 0);
+            
+            // Compute normalized tint direction (all components <= 1.0)
+            float maxCh = Mathf.Max(emissiveColor.r, Mathf.Max(emissiveColor.g, emissiveColor.b));
+            float tintR = maxCh > 0f ? emissiveColor.r / maxCh : 1f;
+            float tintG = maxCh > 0f ? emissiveColor.g / maxCh : 1f;
+            float tintB = maxCh > 0f ? emissiveColor.b / maxCh : 1f;
+            
+            // If tint is white, use normal upload path (benefits from per-texId caching)
+            if (tintR > 0.99f && tintG > 0.99f && tintB > 0.99f)
+            {
+                var handle = UploadUnityTexture(tex, srgb);
+                int texId = tex.GetInstanceID();
+                textureHashCache.TryGetValue(texId, out ulong h);
+                return (handle, h);
+            }
+            
+            // Compound cache key: texture ID + quantized tint color
+            int tintKey = ((int)(tintR * 255) << 16) | ((int)(tintG * 255) << 8) | (int)(tintB * 255);
+            long cacheKey = ((long)tex.GetInstanceID() << 24) ^ (uint)tintKey;
+            
+            if (tintedTextureCache.TryGetValue(cacheKey, out var cached))
+                return cached;
+            
+            try
+            {
+                Color32[] pixels;
+                if (tex.isReadable)
+                {
+                    pixels = tex.GetPixels32();
+                }
+                else
+                {
+                    RenderTextureReadWrite colorSpace = srgb ? RenderTextureReadWrite.sRGB : RenderTextureReadWrite.Linear;
+                    RenderTexture tmp = RenderTexture.GetTemporary(
+                        tex.width, tex.height, 0, RenderTextureFormat.ARGB32, colorSpace);
+                    RenderTexture prev = RenderTexture.active;
+                    Graphics.Blit(tex, tmp);
+                    RenderTexture.active = tmp;
+                    Texture2D readable = new Texture2D(tex.width, tex.height, TextureFormat.RGBA32, false, !srgb);
+                    readable.ReadPixels(new Rect(0, 0, tmp.width, tmp.height), 0, 0);
+                    readable.Apply();
+                    RenderTexture.active = prev;
+                    RenderTexture.ReleaseTemporary(tmp);
+                    pixels = readable.GetPixels32();
+                    UnityEngine.Object.Destroy(readable);
+                }
+                
+                // Tint each pixel by the normalized emission color direction
+                byte tR = (byte)(tintR * 255f);
+                byte tG = (byte)(tintG * 255f);
+                byte tB = (byte)(tintB * 255f);
+                
+                byte[] pixelData = new byte[pixels.Length * 4];
+                for (int i = 0; i < pixels.Length; i++)
+                {
+                    pixelData[i * 4 + 0] = (byte)((pixels[i].r * tR) / 255);
+                    pixelData[i * 4 + 1] = (byte)((pixels[i].g * tG) / 255);
+                    pixelData[i * 4 + 2] = (byte)((pixels[i].b * tB) / 255);
+                    pixelData[i * 4 + 3] = pixels[i].a;
+                }
+                
+                ulong hash = XXHash64.ComputeHash(pixelData, 0, pixelData.Length);
+                if (hash == 0) hash = 1;
+                
+                if (verboseTextureLogging.Value)
+                    logger.LogInfo($"Computed tinted emissive hash for '{tex.name}' tint=({tintR:F2},{tintG:F2},{tintB:F2}): 0x{hash:X16}");
+                
+                GCHandle pinned = GCHandle.Alloc(pixelData, GCHandleType.Pinned);
+                try
+                {
+                    var info = new RemixAPI.remixapi_TextureInfo
+                    {
+                        sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_TEXTURE_INFO,
+                        pNext = IntPtr.Zero,
+                        hash = hash,
+                        width = (uint)tex.width,
+                        height = (uint)tex.height,
+                        depth = 1,
+                        mipLevels = 1,
+                        format = srgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_SRGB
+                                      : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM,
+                        data = pinned.AddrOfPinnedObject(),
+                        dataSize = (ulong)pixelData.Length
+                    };
+                    
+                    IntPtr texHandle;
+                    RemixAPI.remixapi_ErrorCode result;
+                    lock (apiLock) { result = createTextureFunc(ref info, out texHandle); }
+                    
+                    if (result != RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
+                    {
+                        logger.LogError($"Failed to upload tinted emissive '{tex.name}': {result}");
+                        return (IntPtr.Zero, 0);
+                    }
+                    
+                    if (verboseTextureLogging.Value)
+                        logger.LogInfo($"Successfully uploaded tinted emissive '{tex.name}' with handle: 0x{texHandle.ToInt64():X}");
+                    tintedTextureCache[cacheKey] = (texHandle, hash);
+                    return (texHandle, hash);
+                }
+                finally
+                {
+                    pinned.Free();
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogError($"Exception uploading tinted emissive '{tex.name}': {ex.Message}");
+                return (IntPtr.Zero, 0);
             }
         }
         
@@ -795,7 +943,9 @@ namespace UnityRemix
                         albedoPath = DebugTextureHashPath;
                 }
 
-                logger.LogInfo($"[MaterialCreate] '{matData.materialName}': albedo={albedoPath ?? "none"}, normal={normalPath ?? "none"}, alphaMode={matData.alphaMode}");
+                string emissivePath = GetTexturePathFromHandle(matData.emissiveHandle);
+                if (verboseTextureLogging.Value)
+                    logger.LogInfo($"[MaterialCreate] '{matData.materialName}': albedo={albedoPath ?? "none"}, normal={normalPath ?? "none"}, emissive={emissivePath ?? "none"}, emColor=({matData.emissiveColor.r:F3},{matData.emissiveColor.g:F3},{matData.emissiveColor.b:F3}), emIntensity={matData.emissiveIntensity:F3}, alphaMode={matData.alphaMode}");
                 
                 // Build the OpaqueEXT using the blittable Raw struct for safe pNext chaining
                 var opaqueExt = new RemixAPI.remixapi_MaterialInfoOpaqueEXT_Raw
@@ -842,7 +992,8 @@ namespace UnityRemix
                 }
                 
                 // Log all OpaqueEXT values being sent to Remix
-                logger.LogInfo($"[OpaqueEXT] '{matData.materialName}': " +
+                if (verboseTextureLogging.Value)
+                    logger.LogInfo($"[OpaqueEXT] '{matData.materialName}': " +
                     $"sType={opaqueExt.sType} " +
                     $"albedo=({opaqueExt.albedoConstant_x:F3},{opaqueExt.albedoConstant_y:F3},{opaqueExt.albedoConstant_z:F3}) " +
                     $"opacity={opaqueExt.opacityConstant:F3} " +
@@ -869,7 +1020,7 @@ namespace UnityRemix
                         albedoTexture = albedoPath,
                         normalTexture = normalPath,
                         tangentTexture = null,
-                        emissiveTexture = GetTexturePathFromHandle(matData.emissiveHandle),
+                        emissiveTexture = emissivePath,
                         emissiveIntensity = emCombinedIntensity,
                         emissiveColorConstant = new RemixAPI.remixapi_Float3D {
                             x = emMaxCh > 0f ? matData.emissiveColor.r / emMaxCh : 0f,
@@ -897,7 +1048,8 @@ namespace UnityRemix
                         return IntPtr.Zero;
                     }
                     
-                    logger.LogInfo($"Created Remix material '{matData.materialName}' with hash 0x{matHash:X}, handle: 0x{materialHandle.ToInt64():X}");
+                    if (verboseTextureLogging.Value)
+                        logger.LogInfo($"Created Remix material '{matData.materialName}' with hash 0x{matHash:X}, handle: 0x{materialHandle.ToInt64():X}");
                     return materialHandle;
                 }
                 finally
@@ -969,7 +1121,8 @@ namespace UnityRemix
                 }
 
                 if (result == RemixAPI.remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS)
-                    logger.LogInfo($"Created debug placeholder texture (hash: 0x{debugTextureHash:X16})");
+                    if (verboseTextureLogging.Value)
+                        logger.LogInfo($"Created debug placeholder texture (hash: 0x{debugTextureHash:X16})");
                 else
                     logger.LogWarning($"Failed to create debug texture: {result}");
             }

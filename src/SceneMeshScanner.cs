@@ -195,6 +195,7 @@ namespace UnityRemix
             int skippedAlreadyScanned = 0, skippedWrongScene = 0, skippedNoRenderer = 0;
             int skippedNoMesh = 0, skippedNoVerts = 0, skippedNoTris = 0, skippedReadError = 0;
             int gpuReadbackCount = 0;
+            int vertexColorCount = 0;
 
             foreach (var filter in filters)
             {
@@ -387,6 +388,9 @@ namespace UnityRemix
                 // Use filter instance ID in hash so each object gets its own Remix mesh + material binding
                 ulong meshHash = GenerateInstanceMeshHash(mesh, filterId);
 
+                if (colors != null && colors.Length > 0)
+                    vertexColorCount++;
+
                 lock (streamLock)
                 {
                     streamingQueue.Enqueue(new ScannedMeshData
@@ -406,7 +410,7 @@ namespace UnityRemix
 
             if (logDiagnostics || queued > 0)
             {
-                logger.LogInfo($"Scene scan '{scene.name}': {filters.Length} total MeshFilters, {queued} queued ({gpuReadbackCount} via GPU readback)" +
+                logger.LogInfo($"Scene scan '{scene.name}': {filters.Length} total MeshFilters, {queued} queued ({gpuReadbackCount} via GPU readback, {vertexColorCount} with vertex colors)" +
                     $" | skipped: {skippedWrongScene} wrong scene, {skippedAlreadyScanned} already scanned," +
                     $" {skippedNoRenderer} no renderer, {skippedNoMesh} no mesh," +
                     $" {skippedReadError} read error, {skippedNoVerts} no verts, {skippedNoTris} no tris");

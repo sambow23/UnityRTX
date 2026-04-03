@@ -37,6 +37,7 @@ namespace UnityRemix
         private ConfigEntry<bool> configHardwareSkinning;
         private ConfigEntry<bool> configCaptureTextures;
         private ConfigEntry<bool> configCaptureMaterials;
+        private ConfigEntry<bool> configVerboseTextureLogging;
         
         // Scene mesh scanner settings
         private ConfigEntry<bool> configEnableSceneScan;
@@ -157,6 +158,9 @@ namespace UnityRemix
             
             configCaptureMaterials = Config.Bind("Debug", "CaptureMaterials", true,
                 "Enable material capturing and creation.");
+            
+            configVerboseTextureLogging = Config.Bind("Debug", "VerboseTextureLogging", false,
+                "Log detailed texture/material diagnostics (hashes, shader props, emission details). Disable to reduce log spam.");
             
             // Scene scan settings
             configEnableSceneScan = Config.Bind("SceneScan", "EnableSceneScan", true,
@@ -294,6 +298,7 @@ namespace UnityRemix
                 textureCategoryManager,
                 configCaptureTextures,
                 configCaptureMaterials,
+                configVerboseTextureLogging,
                 remixInterface,
                 remixApiLock
             );

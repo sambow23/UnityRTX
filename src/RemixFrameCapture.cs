@@ -963,6 +963,8 @@ namespace UnityRemix
                     var tempMesh = new Mesh();
                     skinned.BakeMesh(tempMesh);
                     uvs = tempMesh.uv;
+                    colors = tempMesh.colors32;
+                    if (colors != null && colors.Length == 0) colors = null;
                     
                     var allTris = new List<int>();
                     for (int s = 0; s < tempMesh.subMeshCount; s++)
@@ -1184,7 +1186,7 @@ namespace UnityRemix
                 if (verts == null || verts.Length == 0 || tris.Length == 0 || tris.Length % 3 != 0)
                     return false;
                 
-                // Vertex colors don't change with animation — read from sharedMesh
+                // Vertex colors don't change with animation — read from sharedMesh or baked mesh
                 Color32[] colors = null;
                 try
                 {
@@ -1192,6 +1194,11 @@ namespace UnityRemix
                     if (sharedMesh != null && sharedMesh.isReadable)
                     {
                         colors = sharedMesh.colors32;
+                        if (colors != null && colors.Length == 0) colors = null;
+                    }
+                    if (colors == null)
+                    {
+                        colors = bakedMesh.colors32;
                         if (colors != null && colors.Length == 0) colors = null;
                     }
                 }
@@ -1227,6 +1234,14 @@ namespace UnityRemix
                     logger.LogError($"BakeMesh failed for '{skinned.name}': {ex.Message}");
                 return false;
             }
+        }
+        
+        /// <summary>
+        /// Combine two ints into a unique hash for per-renderer material IDs
+        /// </summary>
+        private static int HashCombine(int a, int b)
+        {
+            unchecked { return a * 397 ^ b; }
         }
         
         /// <summary>
@@ -1269,7 +1284,36 @@ namespace UnityRemix
             if (bestMaterial != null)
             {
                 matId = bestMaterial.GetInstanceID();
-                materialManager.CaptureMaterialTextures(bestMaterial, matId);
+                
+                // Check for MaterialPropertyBlock overrides (ULTRAKILL uses these for per-weapon emission colors)
+                Color? mpbEmissiveColor = null;
+                float? mpbEmissiveIntensity = null;
+                try
+                {
+                    var mpb = new MaterialPropertyBlock();
+                    skinned.GetPropertyBlock(mpb);
+                    if (!mpb.isEmpty)
+                    {
+                        if (bestMaterial.HasProperty("_EmissiveColor"))
+                        {
+                            var c = mpb.GetColor("_EmissiveColor");
+                            if (c.r != 0 || c.g != 0 || c.b != 0)
+                            {
+                                mpbEmissiveColor = c;
+                                // Generate unique material ID for this renderer's override
+                                matId = HashCombine(bestMaterial.GetInstanceID(), skinned.GetInstanceID());
+                            }
+                        }
+                        if (bestMaterial.HasProperty("_EmissiveIntensity"))
+                        {
+                            float v = mpb.GetFloat("_EmissiveIntensity");
+                            if (v > 0) mpbEmissiveIntensity = v;
+                        }
+                    }
+                }
+                catch { }
+                
+                materialManager.CaptureMaterialTextures(bestMaterial, matId, mpbEmissiveColor, mpbEmissiveIntensity);
                 
                 if (doLog)
                 {
@@ -1277,7 +1321,15 @@ namespace UnityRemix
                     if (!loggedSkinnedMaterials.Contains(logKey))
                     {
                         loggedSkinnedMaterials.Add(logKey);
-                        logger.LogInfo($"  Skinned mesh '{skinned.name}' using material '{bestMaterial.name}' (ID: {matId})");
+                        if (mpbEmissiveColor.HasValue)
+                        {
+                            var c = mpbEmissiveColor.Value;
+                            logger.LogInfo($"  Skinned mesh '{skinned.name}' using material '{bestMaterial.name}' (ID: {matId}) [MPB _EmissiveColor=({c.r:F3},{c.g:F3},{c.b:F3})");
+                        }
+                        else
+                        {
+                            logger.LogInfo($"  Skinned mesh '{skinned.name}' using material '{bestMaterial.name}' (ID: {matId})");
+                        }
                     }
                 }
             }

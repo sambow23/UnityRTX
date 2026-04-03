@@ -170,8 +170,20 @@ namespace UnityRemix
         }
         private Queue<MeshToCreate> meshesToCreate = new Queue<MeshToCreate>();
         private HashSet<int> meshesInQueue = new HashSet<int>(); // Track which meshes are already queued
+        private HashSet<int> failedMeshIds = new HashSet<int>(); // Meshes that failed creation (non-readable)
         
         private int skinnedCaptureCount = 0;
+        private int staticCaptureCount = 0;
+        
+        // Persistent static instance cache: remembers transforms of disabled MeshRenderers
+        // so objects that get deactivated (e.g. CyberGrind cubes after wave settles) keep drawing
+        private struct PersistentStaticInstance
+        {
+            public MeshRenderer renderer; // weak ref via Unity object — becomes null when destroyed
+            public int meshId;
+            public Matrix4x4 localToWorld;
+        }
+        private Dictionary<int, PersistentStaticInstance> persistentStaticInstances = new Dictionary<int, PersistentStaticInstance>();
         private int skinnedRoundRobinIndex = 0; // rotates through cachedSkinnedRenderers each frame (BakeMesh fallback)
         
         // Persistent cache: last-baked data for every skinned mesh, so all are drawn every frame
@@ -312,6 +324,7 @@ namespace UnityRemix
             lastSkinnedTransforms.Clear();
             meshesToCreate.Clear();
             meshesInQueue.Clear();
+            failedMeshIds.Clear();
             loggedSkinnedMaterials.Clear();
             skinnedRoundRobinIndex = 0;
             persistentSkinnedData.Clear();
@@ -319,6 +332,7 @@ namespace UnityRemix
             configuredBufferTargets.Clear();
             cachedTopology.Clear();
             cachedSkinning.Clear();
+            persistentStaticInstances.Clear();
             logger.LogInfo("Renderer caches invalidated");
         }
         
@@ -336,7 +350,39 @@ namespace UnityRemix
             cachedSkinnedRenderers.AddRange(UnityEngine.Object.FindObjectsOfType<SkinnedMeshRenderer>());
             
             rendererCacheFrame = frameCount;
+            
             logger.LogInfo($"Renderer cache refreshed: {cachedRenderers.Count} static, {cachedSkinnedRenderers.Count} skinned");
+            
+            if (configDebugLogInterval.Value > 0)
+            {
+                int gridCount = 0, combinedCount = 0, noMeshCount = 0, disabledCount = 0;
+                foreach (var r in cachedRenderers)
+                {
+                    if (r == null) continue;
+                    if (!r.enabled || !r.gameObject.activeInHierarchy) { disabledCount++; continue; }
+                    var mf = r.GetComponent<MeshFilter>();
+                    if (mf == null || mf.sharedMesh == null) { noMeshCount++; continue; }
+                    string mn = mf.sharedMesh.name;
+                    if (mn != null && mn.Contains("Endless")) gridCount++;
+                    if (mn != null && mn.StartsWith("Combined Mesh")) combinedCount++;
+                }
+                logger.LogInfo($"  breakdown: grid={gridCount} combined={combinedCount} disabled={disabledCount} noMesh={noMeshCount}");
+                
+                if (cachedSkinnedRenderers.Count > 0)
+                {
+                    var sb = new System.Text.StringBuilder();
+                    sb.AppendLine($"[SkinnedDump] All {cachedSkinnedRenderers.Count} SkinnedMeshRenderers:");
+                    for (int i = 0; i < cachedSkinnedRenderers.Count; i++)
+                    {
+                        var sr = cachedSkinnedRenderers[i];
+                        if (sr == null) { sb.AppendLine($"  [{i}] NULL"); continue; }
+                        string meshName = sr.sharedMesh != null ? sr.sharedMesh.name : "NULL_MESH";
+                        int boneCount = sr.bones != null ? sr.bones.Length : 0;
+                        sb.AppendLine($"  [{i}] '{sr.gameObject.name}' mesh='{meshName}' layer={sr.gameObject.layer}({LayerMask.LayerToName(sr.gameObject.layer)}) enabled={sr.enabled} active={sr.gameObject.activeInHierarchy} bones={boneCount} id={sr.GetInstanceID()}");
+                    }
+                    logger.LogInfo(sb.ToString());
+                }
+            }
             
             RefreshRendererSnapshots();
         }
@@ -450,6 +496,9 @@ namespace UnityRemix
             if (!configCaptureStaticMeshes.Value)
                 return;
             
+            staticCaptureCount++;
+            int totalDrawn = 0;
+            
             // Capture static meshes
             foreach (var renderer in cachedRenderers)
             {
@@ -482,8 +531,8 @@ namespace UnityRemix
                 var mesh = meshFilter.sharedMesh;
                 int meshId = mesh.GetInstanceID();
                 
-                // Queue mesh for creation if not cached and not already queued
-                if (!meshConverter.IsMeshCached(meshId) && !meshesInQueue.Contains(meshId))
+                // Queue mesh for creation if not cached, not already queued, and not previously failed
+                if (!meshConverter.IsMeshCached(meshId) && !meshesInQueue.Contains(meshId) && !failedMeshIds.Contains(meshId))
                 {
                     // Capture material textures first
                     var material = renderer.sharedMaterial;
@@ -505,12 +554,68 @@ namespace UnityRemix
                 }
                 
                 // Add instance
+                var transform = renderer.transform.localToWorldMatrix;
                 state.instances.Add(new MeshInstanceData
                 {
                     meshId = meshId,
-                    localToWorld = renderer.transform.localToWorldMatrix
+                    localToWorld = transform
                 });
+                totalDrawn++;
+                
+                // Remember this renderer's transform so we can keep drawing it if it gets disabled
+                int rendererInstanceId = renderer.GetInstanceID();
+                persistentStaticInstances[rendererInstanceId] = new PersistentStaticInstance
+                {
+                    renderer = renderer,
+                    meshId = meshId,
+                    localToWorld = transform
+                };
             }
+            
+            // Draw persistent instances for disabled (but not destroyed) renderers.
+            // This keeps objects visible that the game deactivates (e.g. CyberGrind cubes after wave settles).
+            int persistentDrawn = 0;
+            var keysToRemove = (List<int>)null;
+            foreach (var kv in persistentStaticInstances)
+            {
+                var entry = kv.Value;
+                // Unity null check: renderer was destroyed
+                if (entry.renderer == null)
+                {
+                    if (keysToRemove == null) keysToRemove = new List<int>();
+                    keysToRemove.Add(kv.Key);
+                    continue;
+                }
+                
+                // Skip if the renderer is active — it was already drawn above
+                if (entry.renderer.enabled && entry.renderer.gameObject.activeInHierarchy)
+                    continue;
+                
+                // Skip if mesh isn't cached in Remix yet
+                if (!meshConverter.IsMeshCached(entry.meshId))
+                    continue;
+                
+                // Skip if layer is disabled by user
+                if (IsLayerDisabled(entry.renderer.gameObject.layer))
+                    continue;
+                
+                // Draw with last-known transform
+                state.instances.Add(new MeshInstanceData
+                {
+                    meshId = entry.meshId,
+                    localToWorld = entry.localToWorld
+                });
+                persistentDrawn++;
+            }
+            if (keysToRemove != null)
+            {
+                foreach (var key in keysToRemove)
+                    persistentStaticInstances.Remove(key);
+            }
+            
+            // Periodic tracking
+            if (configDebugLogInterval.Value > 0 && staticCaptureCount % 300 == 1)
+                logger.LogInfo($"[StaticCapture] frame={frameCount} drawn={totalDrawn} persistent={persistentDrawn} total={persistentStaticInstances.Count} queued={meshesToCreate.Count} failedMeshes={failedMeshIds.Count}");
         }
         
         /// <summary>
@@ -545,9 +650,11 @@ namespace UnityRemix
                     // Create mesh with its material!
                     IntPtr handle = meshConverter.CreateRemixMeshFromUnity(meshData.mesh, meshData.material);
                     
-                    if (handle == IntPtr.Zero && configDebugLogInterval.Value > 0)
+                    if (handle == IntPtr.Zero)
                     {
-                        //logger.LogWarning($"Failed to create mesh '{meshData.mesh.name}' in batch");
+                        if (configDebugLogInterval.Value > 0)
+                            logger.LogWarning($"[MeshFail] Failed to create mesh '{meshData.mesh.name}' readable={meshData.mesh.isReadable} vertCount={meshData.mesh.vertexCount} subMeshCount={meshData.mesh.subMeshCount}");
+                        failedMeshIds.Add(meshId);
                     }
                     
                     // Check time budget - break if exceeded
@@ -599,6 +706,9 @@ namespace UnityRemix
                 var skinned = cachedSkinnedRenderers[i];
                 if (skinned == null || !skinned.enabled || !skinned.gameObject.activeInHierarchy)
                 {
+                    // Log if this was a previously tracked mesh (helps debug disappearing geometry)
+                    if (configDebugLogInterval.Value > 0 && skinned != null && persistentSkinnedData.ContainsKey(skinned.GetInstanceID()))
+                        logger.LogWarning($"[SkinSkip] '{skinned.gameObject.name}' id={skinned.GetInstanceID()}: enabled={skinned.enabled}, activeInHierarchy={skinned.gameObject.activeInHierarchy}, activeSelf={skinned.gameObject.activeSelf}");
                     skipNull++;
                     continue;
                 }
@@ -617,6 +727,8 @@ namespace UnityRemix
                 
                 if (skinned.sharedMesh == null)
                 {
+                    if (configDebugLogInterval.Value > 0 && persistentSkinnedData.ContainsKey(skinned.GetInstanceID()))
+                        logger.LogWarning($"[SkinSkip] '{skinned.gameObject.name}' id={skinned.GetInstanceID()}: sharedMesh became NULL");
                     skipNoMesh++;
                     continue;
                 }
@@ -723,7 +835,39 @@ namespace UnityRemix
                     if (!validSkinnedIds.Contains(id))
                         staleIds.Add(id);
                 foreach (var id in staleIds)
+                {
+                    if (configDebugLogInterval.Value > 0)
+                    {
+                        string reason = "unknown";
+                        bool foundInCache = false;
+                        for (int di = 0; di < cachedSkinnedRenderers.Count; di++)
+                        {
+                            var sr = cachedSkinnedRenderers[di];
+                            if (sr == null) continue;
+                            if (sr.GetInstanceID() == id)
+                            {
+                                foundInCache = true;
+                                if (!sr.enabled)
+                                    reason = "renderer DISABLED";
+                                else if (!sr.gameObject.activeInHierarchy)
+                                    reason = $"GameObject INACTIVE (name={sr.gameObject.name})";
+                                else if (IsLayerDisabled(sr.gameObject.layer))
+                                    reason = $"layer {sr.gameObject.layer} disabled";
+                                else if (sr.sharedMesh == null)
+                                    reason = "sharedMesh is NULL";
+                                else
+                                    reason = $"passed filters but not in validSet (enabled={sr.enabled}, active={sr.gameObject.activeInHierarchy}, mesh={sr.sharedMesh?.name})";
+                                break;
+                            }
+                        }
+                        if (!foundInCache)
+                            reason = "NOT in cachedSkinnedRenderers (destroyed or replaced with MeshRenderer?)";
+                        
+                        var pruned = persistentSkinnedData[id];
+                        logger.LogWarning($"[SkinPrune] Removing skinned mesh id={id} (verts={pruned.vertices?.Length}, tris={pruned.triangles?.Length/3}): {reason}");
+                    }
                     persistentSkinnedData.Remove(id);
+                }
             }
             
             // Step 5: Submit ALL persistent entries to frame state

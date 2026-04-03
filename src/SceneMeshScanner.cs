@@ -33,6 +33,7 @@ namespace UnityRemix
             public Vector3[] Vertices;
             public Vector3[] Normals;
             public Vector2[] UVs;
+            public Color32[] Colors;
             public SubMeshSurface[] Surfaces;
             public Matrix4x4 LocalToWorld;
             public int Layer;
@@ -189,7 +190,7 @@ namespace UnityRemix
         private int ScanScene(Scene scene, bool logDiagnostics)
         {
             var filters = Resources.FindObjectsOfTypeAll<MeshFilter>();
-            var combinedDataCache = new Dictionary<int, (Vector3[] verts, Vector3[] norms, Vector2[] uvs, int[][] subIndices)>();
+            var combinedDataCache = new Dictionary<int, (Vector3[] verts, Vector3[] norms, Vector2[] uvs, Color32[] cols, int[][] subIndices)>();
             int queued = 0;
             int skippedAlreadyScanned = 0, skippedWrongScene = 0, skippedNoRenderer = 0;
             int skippedNoMesh = 0, skippedNoVerts = 0, skippedNoTris = 0, skippedReadError = 0;
@@ -240,6 +241,7 @@ namespace UnityRemix
                 Vector3[] vertices = null;
                 Vector3[] normals = null;
                 Vector2[] uvs = null;
+                Color32[] colors = null;
                 int[][] subMeshIndices = null;
 
                 // For combined meshes, reuse cached vertex/index data across renderers
@@ -251,6 +253,7 @@ namespace UnityRemix
                         vertices = cached.verts;
                         normals = cached.norms;
                         uvs = cached.uvs;
+                        colors = cached.cols;
                         subMeshIndices = cached.subIndices;
                     }
                 }
@@ -268,6 +271,8 @@ namespace UnityRemix
                         // Fast path: CPU mesh data available
                         normals = mesh.normals;
                         uvs = mesh.uv;
+                        colors = mesh.colors32;
+                        if (colors != null && colors.Length == 0) colors = null;
                     }
                     else if (mesh.vertexCount > 0)
                     {
@@ -286,7 +291,7 @@ namespace UnityRemix
                     }
 
                     if (isCombinedMesh && vertices != null && vertices.Length > 0)
-                        combinedDataCache[mesh.GetInstanceID()] = (vertices, normals, uvs, subMeshIndices);
+                        combinedDataCache[mesh.GetInstanceID()] = (vertices, normals, uvs, colors, subMeshIndices);
                 }
 
                 if (vertices == null || vertices.Length == 0)
@@ -356,7 +361,7 @@ namespace UnityRemix
                 // For combined meshes, compact vertex arrays so each Remix mesh only
                 // includes the vertices referenced by this renderer's submeshes
                 if (isCombinedMesh && surfaces.Count > 0)
-                    CompactMeshData(ref vertices, ref normals, ref uvs, surfaces);
+                    CompactMeshData(ref vertices, ref normals, ref uvs, ref colors, surfaces);
 
                 if (surfaces.Count == 0)
                 {
@@ -390,6 +395,7 @@ namespace UnityRemix
                         Vertices = vertices,
                         Normals = normals,
                         UVs = uvs,
+                        Colors = colors,
                         Surfaces = surfaces.ToArray(),
                         LocalToWorld = isCombinedMesh ? Matrix4x4.identity : filter.transform.localToWorldMatrix,
                         Layer = filter.gameObject.layer,
@@ -470,6 +476,8 @@ namespace UnityRemix
             var verts = data.Vertices;
             var norms = data.Normals;
             var uvs = data.UVs;
+            var cols = data.Colors;
+            bool hasColors = cols != null && cols.Length == verts.Length;
 
             if (norms == null || norms.Length != verts.Length)
             {
@@ -481,24 +489,42 @@ namespace UnityRemix
             if (uvs == null || uvs.Length != verts.Length)
                 uvs = new Vector2[verts.Length];
 
-            // Convert to Remix vertices (Y-up to Z-up: swap Y and Z)
-            var remixVerts = new RemixAPI.remixapi_HardcodedVertex[verts.Length];
-            for (int i = 0; i < verts.Length; i++)
+            // Check if any surface needs UV tiling/offset applied
+            bool anyNonIdentityST = false;
+            for (int s = 0; s < data.Surfaces.Length; s++)
             {
-                remixVerts[i] = RemixAPI.MakeVertex(
-                    verts[i].x, verts[i].z, verts[i].y,
-                    norms[i].x, norms[i].z, norms[i].y,
-                    uvs[i].x, uvs[i].y,
-                    0xFFFFFFFF
-                );
+                var st = materialManager.GetMainTexST(data.Surfaces[s].MaterialId);
+                if (st.x != 1f || st.y != 1f || st.z != 0f || st.w != 0f)
+                { anyNonIdentityST = true; break; }
             }
 
-            GCHandle vertexHandle = GCHandle.Alloc(remixVerts, GCHandleType.Pinned);
+            var vertexHandles = new List<GCHandle>();
             var indexHandles = new List<GCHandle>();
             var surfaceHandles = new List<GCHandle>();
 
             try
             {
+                RemixAPI.remixapi_HardcodedVertex[] sharedRemixVerts = null;
+                GCHandle sharedVertexHandle = default;
+
+                // If no tiling needed, build shared vertex buffer once (common fast path)
+                if (!anyNonIdentityST)
+                {
+                    sharedRemixVerts = new RemixAPI.remixapi_HardcodedVertex[verts.Length];
+                    for (int i = 0; i < verts.Length; i++)
+                    {
+                        uint col = hasColors ? RemixMeshConverter.Color32ToBGRA(cols[i]) : 0xFFFFFFFF;
+                        sharedRemixVerts[i] = RemixAPI.MakeVertex(
+                            verts[i].x, verts[i].z, verts[i].y,
+                            norms[i].x, norms[i].z, norms[i].y,
+                            uvs[i].x, uvs[i].y,
+                            col
+                        );
+                    }
+                    sharedVertexHandle = GCHandle.Alloc(sharedRemixVerts, GCHandleType.Pinned);
+                    vertexHandles.Add(sharedVertexHandle);
+                }
+
                 // Build one surface per submesh, each with its own material
                 var surfaces = new RemixAPI.remixapi_MeshInfoSurfaceTriangles[data.Surfaces.Length];
                 for (int s = 0; s < data.Surfaces.Length; s++)
@@ -515,10 +541,41 @@ namespace UnityRemix
                     if (surf.MaterialId != 0)
                         materialHandle = materialManager.GetOrCreateMaterial(surf.MaterialId);
 
+                    IntPtr vertsPtr;
+                    ulong vertsCount;
+
+                    if (anyNonIdentityST)
+                    {
+                        // Per-surface vertex buffer with _MainTex_ST applied
+                        var st = materialManager.GetMainTexST(surf.MaterialId);
+                        var surfVerts = new RemixAPI.remixapi_HardcodedVertex[verts.Length];
+                        for (int i = 0; i < verts.Length; i++)
+                        {
+                            float u = uvs[i].x * st.x + st.z;
+                            float v = uvs[i].y * st.y + st.w;
+                            uint col = hasColors ? RemixMeshConverter.Color32ToBGRA(cols[i]) : 0xFFFFFFFF;
+                            surfVerts[i] = RemixAPI.MakeVertex(
+                                verts[i].x, verts[i].z, verts[i].y,
+                                norms[i].x, norms[i].z, norms[i].y,
+                                u, v,
+                                col
+                            );
+                        }
+                        var vHandle = GCHandle.Alloc(surfVerts, GCHandleType.Pinned);
+                        vertexHandles.Add(vHandle);
+                        vertsPtr = vHandle.AddrOfPinnedObject();
+                        vertsCount = (ulong)surfVerts.Length;
+                    }
+                    else
+                    {
+                        vertsPtr = sharedVertexHandle.AddrOfPinnedObject();
+                        vertsCount = (ulong)sharedRemixVerts.Length;
+                    }
+
                     surfaces[s] = new RemixAPI.remixapi_MeshInfoSurfaceTriangles
                     {
-                        vertices_values = vertexHandle.AddrOfPinnedObject(),
-                        vertices_count = (ulong)remixVerts.Length,
+                        vertices_values = vertsPtr,
+                        vertices_count = vertsCount,
                         indices_values = idxHandle.AddrOfPinnedObject(),
                         indices_count = (ulong)surfIndices.Length,
                         skinning_hasvalue = 0,
@@ -560,7 +617,7 @@ namespace UnityRemix
             }
             finally
             {
-                vertexHandle.Free();
+                foreach (var h in vertexHandles) h.Free();
                 foreach (var h in indexHandles) h.Free();
                 foreach (var h in surfaceHandles) h.Free();
             }
@@ -596,7 +653,7 @@ namespace UnityRemix
         /// </summary>
         private static void CompactMeshData(
             ref Vector3[] vertices, ref Vector3[] normals, ref Vector2[] uvs,
-            List<SubMeshSurface> surfaces)
+            ref Color32[] colors, List<SubMeshSurface> surfaces)
         {
             var usedSet = new HashSet<int>();
             foreach (var surf in surfaces)
@@ -619,6 +676,8 @@ namespace UnityRemix
                 ? new Vector3[sorted.Length] : null;
             var newUvs = uvs != null && uvs.Length == vertices.Length
                 ? new Vector2[sorted.Length] : null;
+            var newCols = colors != null && colors.Length == vertices.Length
+                ? new Color32[sorted.Length] : null;
 
             for (int i = 0; i < sorted.Length; i++)
             {
@@ -626,6 +685,7 @@ namespace UnityRemix
                 newVerts[i] = vertices[old];
                 if (newNorms != null) newNorms[i] = normals[old];
                 if (newUvs != null) newUvs[i] = uvs[old];
+                if (newCols != null) newCols[i] = colors[old];
             }
 
             foreach (var surf in surfaces)
@@ -635,6 +695,7 @@ namespace UnityRemix
             vertices = newVerts;
             normals = newNorms;
             uvs = newUvs;
+            colors = newCols;
         }
 
         /// <summary>

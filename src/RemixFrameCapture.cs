@@ -238,6 +238,7 @@ namespace UnityRemix
             public Vector3[] vertices;
             public Vector3[] normals;
             public Vector2[] uvs;
+            public Color32[] colors;
             public int[] triangles;
             public Matrix4x4 localToWorld;
             // GPU skinning: bone transforms per frame (null = software skinned / BakeMesh fallback)
@@ -254,6 +255,7 @@ namespace UnityRemix
             public Vector3[] bindVertices;
             public Vector3[] bindNormals;
             public Vector2[] uvs;
+            public Color32[] colors;
             public int[] triangles;
             public float[] blendWeights;    // bonesPerVertex * vertexCount
             public uint[] blendIndices;     // bonesPerVertex * vertexCount
@@ -667,6 +669,7 @@ namespace UnityRemix
                         vertices = skinData.bindVertices,
                         normals = skinData.bindNormals,
                         uvs = skinData.uvs,
+                        colors = skinData.colors,
                         triangles = skinData.triangles,
                         localToWorld = unscaledMatrix,
                         boneTransforms = boneMatrices,
@@ -931,6 +934,7 @@ namespace UnityRemix
                 // Extract bind-pose geometry
                 Vector3[] bindVerts, bindNorms;
                 Vector2[] uvs;
+                Color32[] colors = null;
                 int[] triangles;
                 
                 if (mesh.isReadable)
@@ -938,6 +942,8 @@ namespace UnityRemix
                     bindVerts = mesh.vertices;
                     bindNorms = mesh.normals;
                     uvs = mesh.uv;
+                    colors = mesh.colors32;
+                    if (colors != null && colors.Length == 0) colors = null;
                     
                     var allTris = new List<int>();
                     for (int s = 0; s < mesh.subMeshCount; s++)
@@ -1063,6 +1069,7 @@ namespace UnityRemix
                     bindVertices = bindVerts,
                     bindNormals = bindNorms,
                     uvs = uvs,
+                    colors = colors,
                     triangles = triangles,
                     blendWeights = blendWeights,
                     blendIndices = blendIndices,
@@ -1177,6 +1184,19 @@ namespace UnityRemix
                 if (verts == null || verts.Length == 0 || tris.Length == 0 || tris.Length % 3 != 0)
                     return false;
                 
+                // Vertex colors don't change with animation — read from sharedMesh
+                Color32[] colors = null;
+                try
+                {
+                    var sharedMesh = skinned.sharedMesh;
+                    if (sharedMesh != null && sharedMesh.isReadable)
+                    {
+                        colors = sharedMesh.colors32;
+                        if (colors != null && colors.Length == 0) colors = null;
+                    }
+                }
+                catch { }
+                
                 persistentSkinnedData[skinnedId] = new SkinnedMeshData
                 {
                     meshId = skinnedId,
@@ -1184,6 +1204,7 @@ namespace UnityRemix
                     vertices = verts,
                     normals = norms,
                     uvs = uvCoords,
+                    colors = colors,
                     triangles = tris,
                     localToWorld = localToWorld
                 };

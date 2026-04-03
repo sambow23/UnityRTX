@@ -367,7 +367,8 @@ namespace UnityRemix
                                 skinned.skinningData.blendWeights,
                                 skinned.skinningData.blendIndices,
                                 skinned.skinningData.bonesPerVertex,
-                                skinned.materialId
+                                skinned.materialId,
+                                skinned.colors
                             );
                             
                             if (meshHandle == IntPtr.Zero)
@@ -391,7 +392,8 @@ namespace UnityRemix
                             skinned.uvs,
                             skinned.triangles,
                             state.frameCount,
-                            skinned.materialId
+                            skinned.materialId,
+                            skinned.colors
                         );
                         
                         if (meshHandle == IntPtr.Zero)

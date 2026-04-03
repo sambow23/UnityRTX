@@ -66,8 +66,14 @@ namespace UnityRemix
             public byte wrapModeU;    // MDL WrapMode: 0=Clamp, 1=Repeat, 2=MirroredRepeat, 3=Clip
             public byte wrapModeV;
             public byte filterMode;   // MDL Filter: 0=Nearest, 1=Linear
+            public Vector4 mainTexST; // _MainTex_ST: (scaleU, scaleV, offsetU, offsetV)
+            public IntPtr emissiveHandle;
+            public ulong emissiveTextureHash;
+            public Color emissiveColor;    // HDR emission color (can exceed 1.0)
+            public float emissiveIntensity;
         }
         private Dictionary<int, MaterialTextureData> materialTextureData = new Dictionary<int, MaterialTextureData>();
+        private HashSet<string> loggedShaderProperties = new HashSet<string>();
         
         // Queue for async material creation
         private Queue<int> pendingMaterialCreation = new Queue<int>();
@@ -115,6 +121,16 @@ namespace UnityRemix
         public bool TryGetMaterialData(int materialId, out MaterialTextureData data)
         {
             return materialTextureData.TryGetValue(materialId, out data);
+        }
+        
+        /// <summary>
+        /// Get _MainTex_ST (tiling/offset) for a material. Returns (1,1,0,0) if unknown.
+        /// </summary>
+        public Vector4 GetMainTexST(int materialId)
+        {
+            if (materialTextureData.TryGetValue(materialId, out var data))
+                return data.mainTexST;
+            return new Vector4(1, 1, 0, 0);
         }
         
         /// <summary>
@@ -208,13 +224,28 @@ namespace UnityRemix
                 alphaCutoff = 0.5f,
                 wrapModeU = 1, // MDL Repeat
                 wrapModeV = 1,
-                filterMode = 1 // MDL Linear
+                filterMode = 1, // MDL Linear
+                mainTexST = new Vector4(1, 1, 0, 0),
+                emissiveHandle = IntPtr.Zero,
+                emissiveTextureHash = 0,
+                emissiveColor = Color.black,
+                emissiveIntensity = 0f
             };
             
             // Get albedo color
             if (material.HasProperty("_Color"))
             {
                 matData.albedoColor = material.GetColor("_Color");
+            }
+            
+            // Capture texture tiling/offset
+            if (material.HasProperty("_MainTex"))
+            {
+                matData.mainTexST = new Vector4(
+                    material.mainTextureScale.x,
+                    material.mainTextureScale.y,
+                    material.mainTextureOffset.x,
+                    material.mainTextureOffset.y);
             }
             
             // Detect alpha mode from shader keywords, _Mode property, and render queue
@@ -260,6 +291,116 @@ namespace UnityRemix
                             logger.LogInfo($"[AlphaFallback] '{material.name}': texture has alpha content, upgrading Opaque -> Cutout (cutoff={matData.alphaCutoff:F2})");
                         }
                     }
+                }
+            }
+            
+            // Dump shader properties once per shader to discover emission/color property names
+            string shaderName = material.shader != null ? material.shader.name : "null";
+            if (material.shader != null && !loggedShaderProperties.Contains(shaderName))
+            {
+                loggedShaderProperties.Add(shaderName);
+                var sb = new System.Text.StringBuilder();
+                sb.Append($"[ShaderProps] '{shaderName}': ");
+                int propCount = material.shader.GetPropertyCount();
+                for (int p = 0; p < propCount; p++)
+                {
+                    var pName = material.shader.GetPropertyName(p);
+                    var pType = material.shader.GetPropertyType(p);
+                    sb.Append($"{pName}({pType}) ");
+                }
+                logger.LogInfo(sb.ToString());
+            }
+            
+            // Upload emission — support both Standard (_EmissionColor/_EmissionMap/_EMISSION keyword)
+            // and ULTRAKILL/Master (_EmissiveColor/_EmissiveTex/_EmissiveIntensity/EMISSIVE toggle)
+            bool hasEmission = false;
+            if (captureTextures.Value)
+            {
+                // Standard shader path
+                if (material.IsKeywordEnabled("_EMISSION") || material.HasProperty("_EmissionColor") || material.HasProperty("_EmissionMap"))
+                {
+                    if (material.HasProperty("_EmissionColor"))
+                    {
+                        matData.emissiveColor = material.GetColor("_EmissionColor");
+                        float maxChannel = Mathf.Max(matData.emissiveColor.r, Mathf.Max(matData.emissiveColor.g, matData.emissiveColor.b));
+                        matData.emissiveIntensity = maxChannel;
+                    }
+                    if (material.HasProperty("_EmissionMap"))
+                    {
+                        var emTex = material.GetTexture("_EmissionMap") as Texture2D;
+                        if (emTex != null)
+                        {
+                            matData.emissiveHandle = UploadUnityTexture(emTex, srgb: true);
+                            if (matData.emissiveHandle != IntPtr.Zero)
+                            {
+                                int texId = emTex.GetInstanceID();
+                                if (textureHashCache.TryGetValue(texId, out ulong hash))
+                                    matData.emissiveTextureHash = hash;
+                            }
+                        }
+                    }
+                    hasEmission = matData.emissiveIntensity > 0f || matData.emissiveHandle != IntPtr.Zero;
+                }
+                
+                // ULTRAKILL/custom shader path: _EmissiveColor, _EmissiveTex, _EmissiveIntensity
+                // Only emit if: toggle is on, OR a dedicated emission texture is assigned
+                if (!hasEmission && material.HasProperty("_EmissiveColor"))
+                {
+                    bool emissiveToggle = true;
+                    if (material.HasProperty("EMISSIVE"))
+                        emissiveToggle = material.GetFloat("EMISSIVE") > 0.5f;
+                    
+                    // A dedicated _EmissiveTex overrides the toggle (artist assigned a glow map)
+                    bool hasEmissiveTex = false;
+                    if (material.HasProperty("_EmissiveTex"))
+                        hasEmissiveTex = material.GetTexture("_EmissiveTex") != null;
+                    
+                    if (emissiveToggle || hasEmissiveTex)
+                    {
+                        matData.emissiveColor = material.GetColor("_EmissiveColor");
+                        
+                        if (material.HasProperty("_EmissiveIntensity"))
+                            matData.emissiveIntensity = material.GetFloat("_EmissiveIntensity");
+                        else
+                        {
+                            float maxCh = Mathf.Max(matData.emissiveColor.r, Mathf.Max(matData.emissiveColor.g, matData.emissiveColor.b));
+                            matData.emissiveIntensity = maxCh;
+                        }
+                        
+                        // Upload _EmissiveTex if present
+                        if (hasEmissiveTex)
+                        {
+                            var emTex = material.GetTexture("_EmissiveTex") as Texture2D;
+                            if (emTex != null)
+                            {
+                                matData.emissiveHandle = UploadUnityTexture(emTex, srgb: true);
+                                if (matData.emissiveHandle != IntPtr.Zero)
+                                {
+                                    int texId = emTex.GetInstanceID();
+                                    if (textureHashCache.TryGetValue(texId, out ulong hash))
+                                        matData.emissiveTextureHash = hash;
+                                }
+                            }
+                        }
+                        
+                        // _UseAlbedoAsEmissive only when toggle is on (not just default property value)
+                        if (emissiveToggle && matData.emissiveHandle == IntPtr.Zero
+                            && material.HasProperty("_UseAlbedoAsEmissive")
+                            && material.GetFloat("_UseAlbedoAsEmissive") > 0.5f
+                            && matData.albedoHandle != IntPtr.Zero)
+                        {
+                            matData.emissiveHandle = matData.albedoHandle;
+                            matData.emissiveTextureHash = matData.albedoTextureHash;
+                        }
+                        
+                        hasEmission = matData.emissiveIntensity > 0f && matData.emissiveHandle != IntPtr.Zero;
+                    }
+                }
+                
+                if (hasEmission)
+                {
+                    logger.LogInfo($"[Emission] '{material.name}': color=({matData.emissiveColor.r:F3},{matData.emissiveColor.g:F3},{matData.emissiveColor.b:F3}) " +
+                        $"intensity={matData.emissiveIntensity:F3} texHash=0x{matData.emissiveTextureHash:X16}");
                 }
             }
             
@@ -715,6 +856,11 @@ namespace UnityRemix
                 
                 try
                 {
+                    // Emissive color: Remix expects a normalized direction color + scalar intensity.
+                    // Compute combined intensity = colorBrightness * separateIntensity, then normalize color.
+                    float emMaxCh = Mathf.Max(matData.emissiveColor.r, Mathf.Max(matData.emissiveColor.g, matData.emissiveColor.b));
+                    float emCombinedIntensity = emMaxCh > 0f ? matData.emissiveIntensity * emMaxCh : matData.emissiveIntensity;
+                    
                     var materialInfo = new RemixAPI.remixapi_MaterialInfo
                     {
                         sType = RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_MATERIAL_INFO,
@@ -723,9 +869,13 @@ namespace UnityRemix
                         albedoTexture = albedoPath,
                         normalTexture = normalPath,
                         tangentTexture = null,
-                        emissiveTexture = null,
-                        emissiveIntensity = 0.0f,
-                        emissiveColorConstant = new RemixAPI.remixapi_Float3D { x = 0, y = 0, z = 0 },
+                        emissiveTexture = GetTexturePathFromHandle(matData.emissiveHandle),
+                        emissiveIntensity = emCombinedIntensity,
+                        emissiveColorConstant = new RemixAPI.remixapi_Float3D {
+                            x = emMaxCh > 0f ? matData.emissiveColor.r / emMaxCh : 0f,
+                            y = emMaxCh > 0f ? matData.emissiveColor.g / emMaxCh : 0f,
+                            z = emMaxCh > 0f ? matData.emissiveColor.b / emMaxCh : 0f
+                        },
                         spriteSheetRow = 1,
                         spriteSheetCol = 1,
                         spriteSheetFps = 0,

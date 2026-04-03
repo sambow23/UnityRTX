@@ -13,6 +13,13 @@ namespace UnityRemix
     /// </summary>
     public class RemixMeshConverter
     {
+        /// <summary>
+        /// Pack a Unity Color32 (RGBA) into D3DCOLOR/BGRA uint32 for Remix's B8G8R8A8_UNORM vertex color.
+        /// </summary>
+        public static uint Color32ToBGRA(Color32 c)
+        {
+            return (uint)(c.b | (c.g << 8) | (c.r << 16) | (c.a << 24));
+        }
         private readonly ManualLogSource logger;
         private readonly RemixMaterialManager materialManager;
         private readonly ConfigEntry<int> configDebugLogInterval;
@@ -112,6 +119,7 @@ namespace UnityRemix
             Vector3[] vertices = mesh.vertices;
             Vector3[] normals = mesh.normals;
             Vector2[] uvs = mesh.uv;
+            Color32[] colors = mesh.colors32;
             
             if (vertices == null || vertices.Length == 0)
                 return IntPtr.Zero;
@@ -171,15 +179,23 @@ namespace UnityRemix
                 uvs = new Vector2[vertices.Length];
             }
             
-            // Convert to Remix vertices (Y-up to Z-up)
+            // Convert to Remix vertices (Y-up to Z-up), applying _MainTex_ST tiling/offset
+            Vector4 st = new Vector4(1, 1, 0, 0);
+            if (material != null)
+                st = materialManager.GetMainTexST(material.GetInstanceID());
+            
+            bool hasColors = colors != null && colors.Length == vertices.Length;
             var remixVerts = new RemixAPI.remixapi_HardcodedVertex[vertices.Length];
             for (int i = 0; i < vertices.Length; i++)
             {
+                float u = uvs[i].x * st.x + st.z;
+                float v = uvs[i].y * st.y + st.w;
+                uint col = hasColors ? Color32ToBGRA(colors[i]) : 0xFFFFFFFF;
                 remixVerts[i] = RemixAPI.MakeVertex(
                     vertices[i].x, vertices[i].z, vertices[i].y,
                     normals[i].x, normals[i].z, normals[i].y,
-                    uvs[i].x, uvs[i].y,
-                    0xFFFFFFFF
+                    u, v,
+                    col
                 );
             }
             
@@ -272,7 +288,8 @@ namespace UnityRemix
             Vector2[] uvs, 
             int[] triangles, 
             int frameHash,
-            int materialId = 0)
+            int materialId = 0,
+            Color32[] colors = null)
         {
             if (vertices == null || vertices.Length == 0 || triangles == null || triangles.Length == 0)
                 return IntPtr.Zero;
@@ -349,14 +366,19 @@ namespace UnityRemix
                 poolData.indexCapacity = triangles.Length;
             }
             
-            // Fill data (Y-up to Z-up conversion)
+            // Fill data (Y-up to Z-up conversion), applying _MainTex_ST tiling/offset
+            Vector4 st = materialManager.GetMainTexST(materialId);
+            bool hasColors = colors != null && colors.Length == vertices.Length;
             for (int i = 0; i < vertices.Length; i++)
             {
+                float u = uvs[i].x * st.x + st.z;
+                float v = uvs[i].y * st.y + st.w;
+                uint col = hasColors ? Color32ToBGRA(colors[i]) : 0xFFFFFFFF;
                 poolData.vertices[i] = RemixAPI.MakeVertex(
                     vertices[i].x, vertices[i].z, vertices[i].y,
                     normals[i].x, normals[i].z, normals[i].y,
-                    uvs[i].x, uvs[i].y,
-                    0xFFFFFFFF
+                    u, v,
+                    col
                 );
             }
             
@@ -494,7 +516,8 @@ namespace UnityRemix
             float[] blendWeights,
             uint[] blendIndices,
             int bonesPerVertex,
-            int materialId)
+            int materialId,
+            Color32[] colors = null)
         {
             if (vertices == null || vertices.Length == 0 || triangles == null || triangles.Length == 0)
                 return IntPtr.Zero;
@@ -510,15 +533,20 @@ namespace UnityRemix
             if (uvs == null || uvs.Length != vertices.Length)
                 uvs = new Vector2[vertices.Length];
             
-            // Build vertex array (Y-up to Z-up)
+            // Build vertex array (Y-up to Z-up), applying _MainTex_ST tiling/offset
+            Vector4 stSkin = materialManager.GetMainTexST(materialId);
+            bool hasColors = colors != null && colors.Length == vertices.Length;
             var remixVerts = new RemixAPI.remixapi_HardcodedVertex[vertices.Length];
             for (int i = 0; i < vertices.Length; i++)
             {
+                float u = uvs[i].x * stSkin.x + stSkin.z;
+                float v = uvs[i].y * stSkin.y + stSkin.w;
+                uint col = hasColors ? Color32ToBGRA(colors[i]) : 0xFFFFFFFF;
                 remixVerts[i] = RemixAPI.MakeVertex(
                     vertices[i].x, vertices[i].z, vertices[i].y,
                     normals[i].x, normals[i].z, normals[i].y,
-                    uvs[i].x, uvs[i].y,
-                    0xFFFFFFFF
+                    u, v,
+                    col
                 );
             }
             

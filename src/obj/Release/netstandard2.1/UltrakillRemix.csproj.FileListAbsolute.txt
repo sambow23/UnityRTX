@@ -1,0 +1,10 @@
+C:\Users\MJBee\Desktop\bendyandthedark\UnityRTX-0.2\src\obj\Release\netstandard2.1\UltrakillRemix.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\MJBee\Desktop\bendyandthedark\UnityRTX-0.2\src\obj\Release\netstandard2.1\UltrakillRemix.AssemblyInfoInputs.cache
+C:\Users\MJBee\Desktop\bendyandthedark\UnityRTX-0.2\src\obj\Release\netstandard2.1\UltrakillRemix.AssemblyInfo.cs
+C:\Users\MJBee\Desktop\bendyandthedark\UnityRTX-0.2\src\obj\Release\netstandard2.1\UltrakillRemix.csproj.CoreCompileInputs.cache
+C:\Users\MJBee\Desktop\bendyandthedark\UnityRTX-0.2\src\obj\Release\netstandard2.1\UltrakillRemix.csproj.AssemblyReference.cache
+C:\Users\MJBee\Desktop\bendyandthedark\UnityRTX-0.2\src\bin\Release\netstandard2.1\UnityRemix.deps.json
+C:\Users\MJBee\Desktop\bendyandthedark\UnityRTX-0.2\src\bin\Release\netstandard2.1\UnityRemix.dll
+C:\Users\MJBee\Desktop\bendyandthedark\UnityRTX-0.2\src\bin\Release\netstandard2.1\UnityRemix.pdb
+C:\Users\MJBee\Desktop\bendyandthedark\UnityRTX-0.2\src\obj\Release\netstandard2.1\UnityRemix.dll
+C:\Users\MJBee\Desktop\bendyandthedark\UnityRTX-0.2\src\obj\Release\netstandard2.1\UnityRemix.pdb

@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
+using BepInEx;
 using BepInEx.Logging;
 using UnityEngine;
 
@@ -18,6 +20,7 @@ namespace UnityRemix
         private readonly BepInEx.Configuration.ConfigEntry<bool> captureMaterials;
         private readonly BepInEx.Configuration.ConfigEntry<bool> verboseTextureLogging;
         private readonly object apiLock;
+        private readonly string derivedTextureDumpDirectory;
         
         // Cached delegates
         private RemixAPI.PFN_remixapi_CreateTexture createTextureFunc;
@@ -77,6 +80,7 @@ namespace UnityRemix
         
         // Cache for tinted emissive textures - maps (texId ^ tintColorKey) to (handle, hash)
         private Dictionary<long, (IntPtr handle, ulong hash)> tintedTextureCache = new Dictionary<long, (IntPtr, ulong)>();
+        private Dictionary<long, (IntPtr handle, ulong hash)> derivedTextureCache = new Dictionary<long, (IntPtr, ulong)>();
         
         // Deferred texture upload queue — main thread prepares pixel data, render thread calls Remix API.
         // Prevents cross-thread DXVK lock contention between CreateTexture (s_mutex→devLock) and Present (devLock→submission).
@@ -92,7 +96,9 @@ namespace UnityRemix
         private readonly Queue<PendingTextureUpload> pendingTextureUploads = new Queue<PendingTextureUpload>();
         private readonly HashSet<int> pendingTextureIds = new HashSet<int>();
         private readonly HashSet<long> pendingTintedKeys = new HashSet<long>();
+        private readonly HashSet<long> pendingDerivedKeys = new HashSet<long>();
         private readonly object pendingTextureLock = new object();
+        private readonly bool enableAlbedoDerivedPbr;
         
         // Alpha handling modes detected from Unity materials
         public enum AlphaMode
@@ -123,6 +129,16 @@ namespace UnityRemix
             public Color emissiveColor;    // HDR emission color (can exceed 1.0)
             public float emissiveIntensity;
             public bool useEmissiveBlend;  // Use kAlphaEmissive blend instead of kAlpha
+            public IntPtr roughnessHandle;
+            public IntPtr metallicHandle;
+            public IntPtr heightHandle;
+            public ulong roughnessTextureHash;
+            public ulong metallicTextureHash;
+            public ulong heightTextureHash;
+            public float roughnessConstant;
+            public float metallicConstant;
+            public float displaceIn;
+            public float displaceOut;
         }
         private System.Collections.Concurrent.ConcurrentDictionary<int, MaterialTextureData> materialTextureData = new System.Collections.Concurrent.ConcurrentDictionary<int, MaterialTextureData>();
         private HashSet<string> loggedShaderProperties = new HashSet<string>();
@@ -148,6 +164,9 @@ namespace UnityRemix
             this.captureMaterials = captureMaterials;
             this.verboseTextureLogging = verboseTextureLogging;
             this.apiLock = apiLock;
+            enableAlbedoDerivedPbr = Paths.GameRootPath.IndexOf("ULTRAKILL", StringComparison.OrdinalIgnoreCase) >= 0;
+            derivedTextureDumpDirectory = Path.Combine(Paths.BepInExRootPath, "UnityRemixDerivedTextures");
+            Directory.CreateDirectory(derivedTextureDumpDirectory);
             
             // Cache delegates
             if (remixInterface.CreateTexture != IntPtr.Zero)
@@ -284,7 +303,17 @@ namespace UnityRemix
                 emissiveHandle = IntPtr.Zero,
                 emissiveTextureHash = 0,
                 emissiveColor = Color.black,
-                emissiveIntensity = 0f
+                emissiveIntensity = 0f,
+                roughnessHandle = IntPtr.Zero,
+                metallicHandle = IntPtr.Zero,
+                heightHandle = IntPtr.Zero,
+                roughnessTextureHash = 0,
+                metallicTextureHash = 0,
+                heightTextureHash = 0,
+                roughnessConstant = 0.5f,
+                metallicConstant = 0f,
+                displaceIn = 0f,
+                displaceOut = 0f
             };
             
             // Get albedo color
@@ -310,6 +339,16 @@ namespace UnityRemix
             {
                 matData.alphaCutoff = material.GetFloat("_Cutoff");
             }
+
+            matData.metallicConstant = ReadFirstFloat(material, 0f, "_Metallic", "_Metalness", "_MetallicValue");
+            float smoothness = ReadFirstFloat(material, -1f, "_Glossiness", "_Smoothness", "_SmoothnessValue", "_SpecularHighlights");
+            if (smoothness >= 0f)
+                matData.roughnessConstant = 1f - Mathf.Clamp01(smoothness);
+            else
+                matData.roughnessConstant = Mathf.Clamp01(ReadFirstFloat(material, 0.5f, "_Roughness", "_RoughnessValue"));
+            matData.metallicConstant = Mathf.Clamp01(matData.metallicConstant);
+            matData.displaceIn = ReadFirstFloat(material, 0f, "_Parallax", "_HeightScale", "_DisplacementScale");
+            matData.displaceOut = matData.displaceIn;
             
             // Detailed diagnostic log for every material
             if (verboseTextureLogging.Value)
@@ -330,7 +369,7 @@ namespace UnityRemix
                     // Read Unity wrap/filter modes from texture and convert to MDL values
                     matData.wrapModeU = UnityWrapToMdl(tex.wrapModeU);
                     matData.wrapModeV = UnityWrapToMdl(tex.wrapModeV);
-                    matData.filterMode = (byte)(tex.filterMode == FilterMode.Point ? 0 : 1);
+                    matData.filterMode = 0;
                     
                     matData.albedoHandle = UploadUnityTexture(tex, srgb: true);
                     if (matData.albedoHandle != IntPtr.Zero)
@@ -402,14 +441,15 @@ namespace UnityRemix
                 bool hasActiveEmissionMap = material.HasProperty("_EmissionMap") && material.GetTexture("_EmissionMap") != null;
                 if (material.IsKeywordEnabled("_EMISSION") || hasActiveEmissionMap)
                 {
+                    float maxChannel = 0f;
                     if (material.HasProperty("_EmissionColor"))
                     {
                         matData.emissiveColor = material.GetColor("_EmissionColor");
-                        float maxChannel = Mathf.Max(matData.emissiveColor.r, Mathf.Max(matData.emissiveColor.g, matData.emissiveColor.b));
+                        maxChannel = Mathf.Max(matData.emissiveColor.r, Mathf.Max(matData.emissiveColor.g, matData.emissiveColor.b));
                         // Store 1.0 as intensity — CreateRemixMaterialSimple already folds maxChannel into
                         // emCombinedIntensity (= maxCh * emissiveIntensity), so storing maxChannel here
                         // would double it. The HDR brightness lives in the color, not the intensity.
-                        matData.emissiveIntensity = maxChannel > 0f ? 1.0f : 0f;
+                        matData.emissiveIntensity = maxChannel > 1.01f ? 1.0f : 0f;
                     }
                     if (hasActiveEmissionMap)
                     {
@@ -421,18 +461,20 @@ namespace UnityRemix
                             matData.emissiveTextureHash = emHash;
                         }
                     }
-                    hasEmission = matData.emissiveIntensity > 0f || matData.emissiveHandle != IntPtr.Zero;
+                    hasEmission = matData.emissiveHandle != IntPtr.Zero || (matData.emissiveIntensity > 0f && maxChannel > 1.01f);
                 }
                 
                 // ULTRAKILL/custom shader path: _EmissiveColor, _EmissiveTex, _EmissiveIntensity
                 // Only emit if: toggle is on, OR a dedicated emission texture is assigned, OR MPB override is present
                 if (!hasEmission && material.HasProperty("_EmissiveColor"))
                 {
-                    bool emissiveToggle = true;
+                    bool emissiveToggle = false;
                     if (material.HasProperty("EMISSIVE"))
                         emissiveToggle = material.GetFloat("EMISSIVE") > 0.5f;
                     
-                    // A dedicated _EmissiveTex overrides the toggle (artist assigned a glow map)
+                    bool likelyEmissiveMaterial = IsLikelyEmissiveMaterial(material, shaderName);
+
+                    // A dedicated _EmissiveTex overrides the toggle only for materials that are actually intended to emit
                     bool hasEmissiveTex = false;
                     if (material.HasProperty("_EmissiveTex"))
                         hasEmissiveTex = material.GetTexture("_EmissiveTex") != null;
@@ -440,19 +482,25 @@ namespace UnityRemix
                     // MPB color override also triggers emission
                     bool hasMpbOverride = mpbEmissiveColor.HasValue;
                     
-                    if (emissiveToggle || hasEmissiveTex || hasMpbOverride)
+                    bool useAlbedoAsEmissive = material.HasProperty("_UseAlbedoAsEmissive")
+                        && material.GetFloat("_UseAlbedoAsEmissive") > 0.5f
+                        && matData.albedoHandle != IntPtr.Zero;
+                    Color candidateEmissiveColor = mpbEmissiveColor ?? material.GetColor("_EmissiveColor");
+                    float candidateEmissiveIntensity = mpbEmissiveIntensity
+                        ?? (material.HasProperty("_EmissiveIntensity")
+                            ? material.GetFloat("_EmissiveIntensity")
+                            : Mathf.Max(candidateEmissiveColor.r, Mathf.Max(candidateEmissiveColor.g, candidateEmissiveColor.b)));
+                    float candidateEmissiveMax = Mathf.Max(candidateEmissiveColor.r, Mathf.Max(candidateEmissiveColor.g, candidateEmissiveColor.b));
+                    bool hasActiveEmissiveValues = candidateEmissiveMax > 1.01f || candidateEmissiveIntensity > 1.01f;
+                    
+                    if ((emissiveToggle && likelyEmissiveMaterial) || hasEmissiveTex || hasMpbOverride || useAlbedoAsEmissive || hasActiveEmissiveValues)
                     {
-                        matData.emissiveColor = mpbEmissiveColor ?? material.GetColor("_EmissiveColor");
-                        
-                        if (mpbEmissiveIntensity.HasValue)
-                            matData.emissiveIntensity = mpbEmissiveIntensity.Value;
-                        else if (material.HasProperty("_EmissiveIntensity"))
-                            matData.emissiveIntensity = material.GetFloat("_EmissiveIntensity");
-                        else
-                        {
-                            float maxCh = Mathf.Max(matData.emissiveColor.r, Mathf.Max(matData.emissiveColor.g, matData.emissiveColor.b));
-                            matData.emissiveIntensity = maxCh;
-                        }
+                        matData.emissiveColor = candidateEmissiveColor;
+                        matData.emissiveIntensity = candidateEmissiveIntensity;
+
+                        float emissiveColorMax = Mathf.Max(matData.emissiveColor.r, Mathf.Max(matData.emissiveColor.g, matData.emissiveColor.b));
+                        if (!hasEmissiveTex && !hasMpbOverride && emissiveColorMax <= 1.01f && matData.emissiveIntensity <= 1.01f)
+                            matData.emissiveIntensity = 0f;
                         
                         // Upload _EmissiveTex if present, pre-tinted by emission color
                         if (hasEmissiveTex)
@@ -467,10 +515,7 @@ namespace UnityRemix
                         }
                         
                         // _UseAlbedoAsEmissive only when toggle is on (not just default property value)
-                        if (emissiveToggle && matData.emissiveHandle == IntPtr.Zero
-                            && material.HasProperty("_UseAlbedoAsEmissive")
-                            && material.GetFloat("_UseAlbedoAsEmissive") > 0.5f
-                            && matData.albedoHandle != IntPtr.Zero)
+                        if (useAlbedoAsEmissive && matData.emissiveHandle == IntPtr.Zero)
                         {
                             if (albedoTex != null)
                             {
@@ -485,7 +530,13 @@ namespace UnityRemix
                             }
                         }
                         
-                        hasEmission = matData.emissiveIntensity > 0f && matData.emissiveHandle != IntPtr.Zero;
+                        if (matData.emissiveHandle == IntPtr.Zero && matData.albedoHandle != IntPtr.Zero && hasActiveEmissiveValues)
+                        {
+                            matData.emissiveHandle = matData.albedoHandle;
+                            matData.emissiveTextureHash = matData.albedoTextureHash;
+                        }
+
+                        hasEmission = matData.emissiveIntensity > 0f && (matData.emissiveHandle != IntPtr.Zero || hasActiveEmissiveValues);
                     }
                 }
                 
@@ -613,25 +664,89 @@ namespace UnityRemix
             }
             
             // Upload normal map
-            if (captureTextures.Value && material.HasProperty("_BumpMap"))
+            if (captureTextures.Value)
             {
-                var tex = material.GetTexture("_BumpMap") as Texture2D;
+                var tex = GetFirstTexture(material, "_BumpMap", "_Normal", "_NormalMap", "_Normals");
                 if (tex != null)
                 {
-                    matData.normalHandle = UploadUnityTexture(tex, srgb: false, isNormalMap: true);
+                    var (normalHandle, normalHash) = UploadOctahedralNormalTexture(tex);
+                    matData.normalHandle = normalHandle;
                     if (matData.normalHandle != IntPtr.Zero)
                     {
-                        int texId = tex.GetInstanceID();
-                        if (textureHashCache.TryGetValue(texId, out ulong hash))
-                        {
-                            matData.normalTextureHash = hash;
-                        }
+                        matData.normalTextureHash = normalHash;
                         if (verboseTextureLogging.Value)
                             logger.LogInfo($"Captured normal texture for material '{material.name}' (hash: 0x{matData.normalTextureHash:X16})");
                     }
                 }
+                else if (enableAlbedoDerivedPbr && albedoTex != null)
+                {
+                    var (normalHandle, normalHash) = UploadAlbedoDerivedNormalTexture(albedoTex);
+                    matData.normalHandle = normalHandle;
+                    matData.normalTextureHash = normalHash;
+                }
             }
             
+            if (captureTextures.Value)
+            {
+                Texture2D metallicTex = GetFirstTexture(material, "_MetallicGlossMap", "_MetallicMap", "_MetalnessMap", "_MetallicTex");
+                if (metallicTex != null)
+                {
+                    matData.metallicHandle = UploadUnityTexture(metallicTex, srgb: false);
+                    if (matData.metallicHandle != IntPtr.Zero)
+                    {
+                        int texId = metallicTex.GetInstanceID();
+                        if (textureHashCache.TryGetValue(texId, out ulong hash))
+                            matData.metallicTextureHash = hash;
+                    }
+                }
+                else if (enableAlbedoDerivedPbr && albedoTex != null)
+                {
+                    var (metalHandle, metalHash) = UploadAlbedoDerivedMetallicTexture(albedoTex, material.name);
+                    matData.metallicHandle = metalHandle;
+                    matData.metallicTextureHash = metalHash;
+                }
+
+                Texture2D roughnessTex = GetFirstTexture(material, "_RoughnessMap", "_RoughnessTex");
+                if (roughnessTex != null)
+                {
+                    matData.roughnessHandle = UploadUnityTexture(roughnessTex, srgb: false);
+                    if (matData.roughnessHandle != IntPtr.Zero)
+                    {
+                        int texId = roughnessTex.GetInstanceID();
+                        if (textureHashCache.TryGetValue(texId, out ulong hash))
+                            matData.roughnessTextureHash = hash;
+                    }
+                }
+                else
+                {
+                    Texture2D glossOrSpecTex = GetFirstTexture(material, "_SpecGlossMap", "_GlossMap", "_Specular", "_SpecularMap");
+                    if (glossOrSpecTex != null)
+                    {
+                        var (roughHandle, roughHash) = UploadDerivedRoughnessTexture(glossOrSpecTex);
+                        matData.roughnessHandle = roughHandle;
+                        matData.roughnessTextureHash = roughHash;
+                    }
+                    else if (enableAlbedoDerivedPbr && albedoTex != null)
+                    {
+                        var (roughHandle, roughHash) = UploadAlbedoDerivedRoughnessTexture(albedoTex, material.name);
+                        matData.roughnessHandle = roughHandle;
+                        matData.roughnessTextureHash = roughHash;
+                    }
+                }
+
+                Texture2D heightTex = GetFirstTexture(material, "_ParallaxMap", "_HeightMap", "_DisplacementMap", "_DisplacementTex");
+                if (heightTex != null)
+                {
+                    matData.heightHandle = UploadUnityTexture(heightTex, srgb: false);
+                    if (matData.heightHandle != IntPtr.Zero)
+                    {
+                        int texId = heightTex.GetInstanceID();
+                        if (textureHashCache.TryGetValue(texId, out ulong hash))
+                            matData.heightTextureHash = hash;
+                    }
+                }
+            }
+
             // Store for later use
             materialTextureData[materialId] = matData;
             
@@ -641,7 +756,54 @@ namespace UnityRemix
             
             string albedoPath = GetTexturePathFromHandle(matData.albedoHandle);
             string normalPath = GetTexturePathFromHandle(matData.normalHandle);
-            logger.LogInfo($"[MatCapture] '{material.name}' shader='{material.shader?.name}' albedo={albedoPath ?? "NONE"} normal={normalPath ?? "none"}");
+            string roughnessPath = GetTexturePathFromHandle(matData.roughnessHandle);
+            string metallicPath = GetTexturePathFromHandle(matData.metallicHandle);
+            string heightPath = GetTexturePathFromHandle(matData.heightHandle);
+            logger.LogInfo($"[MatCapture] '{material.name}' shader='{material.shader?.name}' albedo={albedoPath ?? "NONE"} normal={normalPath ?? "none"} roughnessMap={roughnessPath ?? "none"} metallicMap={metallicPath ?? "none"} heightMap={heightPath ?? "none"} roughness={matData.roughnessConstant:F3} metallic={matData.metallicConstant:F3}");
+        }
+
+        private static bool IsLikelyEmissiveMaterial(Material material, string shaderName)
+        {
+            string materialName = material.name ?? string.Empty;
+            if (shaderName.IndexOf("Emissive", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+            if (shaderName.IndexOf("Emission", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+            if (materialName.IndexOf("Emissive", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+            if (materialName.IndexOf("Emission", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+            if (materialName.IndexOf("Light", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+            if (materialName.IndexOf("Lamp", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+            if (materialName.IndexOf("Neon", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+            return false;
+        }
+
+        private static float ReadFirstFloat(Material material, float fallback, params string[] propertyNames)
+        {
+            foreach (string propertyName in propertyNames)
+            {
+                if (material.HasProperty(propertyName))
+                    return material.GetFloat(propertyName);
+            }
+            return fallback;
+        }
+
+        private static Texture2D GetFirstTexture(Material material, params string[] propertyNames)
+        {
+            foreach (string propertyName in propertyNames)
+            {
+                if (!material.HasProperty(propertyName))
+                    continue;
+
+                Texture2D texture = material.GetTexture(propertyName) as Texture2D;
+                if (texture != null)
+                    return texture;
+            }
+            return null;
         }
         
         /// <summary>
@@ -698,6 +860,7 @@ namespace UnityRemix
         {
             if (unityTexture == null || createTextureFunc == null)
                 return IntPtr.Zero;
+            bool uploadAsSrgb = false;
                 
             int texId = unityTexture.GetInstanceID();
             
@@ -788,9 +951,9 @@ namespace UnityRemix
                     }
                     
                     hashSourceData = pixelData;
-                    format = srgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_SRGB 
-                                  : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM;
-                    
+                    format = uploadAsSrgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_SRGB 
+                                          : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM;
+
                     actualMipLevels = 1; // GPU readback only gives top mip
                     UnityEngine.Object.Destroy(readableTexture);
                 }
@@ -807,8 +970,8 @@ namespace UnityRemix
                         pixelData[i * 4 + 3] = 255;
                     }
                     hashSourceData = pixelData;
-                    format = srgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_SRGB 
-                                  : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM;
+                    format = uploadAsSrgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_SRGB 
+                                          : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM;
                 }
                 else
                 {
@@ -819,20 +982,20 @@ namespace UnityRemix
                     switch (unityTexture.format)
                     {
                         case TextureFormat.RGBA32:
-                            format = srgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_SRGB 
-                                          : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM;
+                            format = uploadAsSrgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_SRGB 
+                                                  : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM;
                             break;
                         case TextureFormat.BGRA32:
-                            format = srgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_B8G8R8A8_SRGB 
-                                          : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_B8G8R8A8_UNORM;
+                            format = uploadAsSrgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_B8G8R8A8_SRGB 
+                                                  : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_B8G8R8A8_UNORM;
                             break;
                         case TextureFormat.DXT1:
-                            format = srgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC1_RGB_SRGB 
-                                          : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC1_RGB_UNORM;
+                            format = uploadAsSrgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC1_RGB_SRGB 
+                                                  : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC1_RGB_UNORM;
                             break;
                         case TextureFormat.DXT5:
-                            format = srgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_SRGB 
-                                          : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_UNORM;
+                            format = uploadAsSrgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_SRGB 
+                                                  : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_UNORM;
                             break;
                         default:
                             logger.LogWarning($"Unsupported texture format: {unityTexture.format}");
@@ -857,7 +1020,11 @@ namespace UnityRemix
                 {
                     hasAlpha = SampleAlphaBC3(pixelData);
                 }
-                // BC1 (DXT1) has only 1-bit punch-through alpha, treat as opaque
+                else if (format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC1_RGB_SRGB ||
+                         format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC1_RGB_UNORM)
+                {
+                    hasAlpha = SampleAlphaBC1(pixelData);
+                }
                 
                 if (hasAlpha)
                 {
@@ -867,7 +1034,10 @@ namespace UnityRemix
                     // This distinguishes real transparency (decal backgrounds at alpha=0) from
                     // smoothness-as-alpha packing (Standard shader Opaque mode, values ~50-230).
                     bool hasCutoutAlpha;
-                    if (format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_SRGB ||
+                    if (format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC1_RGB_SRGB ||
+                        format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC1_RGB_UNORM)
+                        hasCutoutAlpha = SampleCutoutAlphaBC1(pixelData);
+                    else if (format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_SRGB ||
                         format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_UNORM)
                         hasCutoutAlpha = SampleCutoutAlphaBC3(pixelData);
                     else
@@ -1114,6 +1284,473 @@ namespace UnityRemix
                 return (IntPtr.Zero, 0);
             }
         }
+
+        private (IntPtr handle, ulong hash) UploadDerivedRoughnessTexture(Texture2D tex)
+        {
+            if (tex == null || createTextureFunc == null)
+                return (IntPtr.Zero, 0);
+
+            long cacheKey = ((long)tex.GetInstanceID() << 24) ^ 0x524F5547L;
+            ulong hash = BuildDerivedCacheHash(tex, "roughness");
+
+            lock (pendingTextureLock)
+            {
+                if (derivedTextureCache.TryGetValue(cacheKey, out var cached))
+                    return cached;
+                if (pendingDerivedKeys.Contains(cacheKey))
+                    return (new IntPtr((long)hash), hash);
+            }
+
+            try
+            {
+                byte[] pixelData;
+                if (TryGetExistingDerivedTexture(tex, "roughness", hash, out string roughnessDumpPath, out ulong dumpedHash))
+                {
+                    hash = dumpedHash;
+                    pixelData = ReadTgaRgba32(roughnessDumpPath, tex.width, tex.height);
+                    if (verboseTextureLogging.Value)
+                        logger.LogInfo($"Using existing dumped roughness texture for '{tex.name}' -> {roughnessDumpPath}");
+                }
+                else
+                {
+                    Color32[] pixels = ReadTexturePixels(tex);
+                    pixelData = new byte[pixels.Length * 4];
+                    for (int i = 0; i < pixels.Length; i++)
+                    {
+                        float spec = Mathf.Max(pixels[i].r, Mathf.Max(pixels[i].g, pixels[i].b)) / 255f;
+                        float smoothness = pixels[i].a < 250 ? pixels[i].a / 255f : spec;
+                        float roughness = Mathf.Clamp(1f - smoothness, 0.18f, 0.92f);
+                        byte r = (byte)(roughness * 255f);
+                        pixelData[i * 4 + 0] = r;
+                        pixelData[i * 4 + 1] = r;
+                        pixelData[i * 4 + 2] = r;
+                        pixelData[i * 4 + 3] = 255;
+                    }
+                    pixelData = DumpAndLoadDerivedTexture(tex.name, "roughness", hash, tex.width, tex.height, pixelData);
+                }
+
+                QueueDerivedTextureUpload(cacheKey, hash, pixelData, tex.width, tex.height);
+                return (new IntPtr((long)hash), hash);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError($"Exception deriving roughness from '{tex.name}': {ex.Message}");
+                return (IntPtr.Zero, 0);
+            }
+        }
+
+        private (IntPtr handle, ulong hash) UploadOctahedralNormalTexture(Texture2D tex)
+        {
+            if (tex == null || createTextureFunc == null)
+                return (IntPtr.Zero, 0);
+
+            long cacheKey = ((long)tex.GetInstanceID() << 24) ^ 0x4F43544EL;
+            ulong hash = BuildDerivedCacheHash(tex, "octnormal");
+
+            lock (pendingTextureLock)
+            {
+                if (derivedTextureCache.TryGetValue(cacheKey, out var cached))
+                    return cached;
+                if (pendingDerivedKeys.Contains(cacheKey))
+                    return (new IntPtr((long)hash), hash);
+            }
+
+            try
+            {
+                byte[] pixelData;
+                if (TryGetExistingDerivedTexture(tex, "octnormal", hash, out string normalDumpPath, out ulong dumpedHash))
+                {
+                    hash = dumpedHash;
+                    pixelData = ReadTgaRgba32(normalDumpPath, tex.width, tex.height);
+                    if (verboseTextureLogging.Value)
+                        logger.LogInfo($"Using existing dumped octnormal texture for '{tex.name}' -> {normalDumpPath}");
+                }
+                else
+                {
+                    Color32[] pixels = ReadTexturePixels(tex);
+                    bool dxt5nm = tex.format == TextureFormat.DXT5 || tex.format == TextureFormat.DXT5Crunched;
+                    pixelData = new byte[pixels.Length * 4];
+
+                    for (int i = 0; i < pixels.Length; i++)
+                    {
+                        float nx = dxt5nm ? pixels[i].a / 127.5f - 1f : pixels[i].r / 127.5f - 1f;
+                        float ny = pixels[i].g / 127.5f - 1f;
+                        nx = -nx;
+                        ny = -ny;
+
+                        float nz = Mathf.Sqrt(Mathf.Max(0f, 1f - nx * nx - ny * ny));
+                        float invL1 = 1f / (Mathf.Abs(nx) + Mathf.Abs(ny) + Mathf.Abs(nz) + 1e-6f);
+                        float ox = nx * invL1;
+                        float oy = ny * invL1;
+
+                        if (nz < 0f)
+                        {
+                            float oldX = ox;
+                            ox = (1f - Mathf.Abs(oy)) * Mathf.Sign(oldX);
+                            oy = (1f - Mathf.Abs(oldX)) * Mathf.Sign(oy);
+                        }
+
+                        pixelData[i * 4 + 0] = (byte)(Mathf.Clamp01(ox * 0.5f + 0.5f) * 255f);
+                        pixelData[i * 4 + 1] = (byte)(Mathf.Clamp01(oy * 0.5f + 0.5f) * 255f);
+                        pixelData[i * 4 + 2] = 255;
+                        pixelData[i * 4 + 3] = 255;
+                    }
+                    pixelData = DumpAndLoadDerivedTexture(tex.name, "octnormal", hash, tex.width, tex.height, pixelData);
+                }
+
+                QueueDerivedTextureUpload(cacheKey, hash, pixelData, tex.width, tex.height);
+                return (new IntPtr((long)hash), hash);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError($"Exception deriving octahedral normal from '{tex.name}': {ex.Message}");
+                return (IntPtr.Zero, 0);
+            }
+        }
+
+        private (IntPtr handle, ulong hash) UploadAlbedoDerivedRoughnessTexture(Texture2D tex, string materialName)
+        {
+            if (tex == null || createTextureFunc == null)
+                return (IntPtr.Zero, 0);
+
+            ulong nameHash = Fnv1a64(materialName ?? string.Empty);
+            long cacheKey = ((long)tex.GetInstanceID() << 24) ^ 0x414C4252L ^ (long)nameHash;
+            ulong hash = BuildDerivedCacheHash(tex, "albedorough") ^ nameHash;
+
+            lock (pendingTextureLock)
+            {
+                if (derivedTextureCache.TryGetValue(cacheKey, out var cached))
+                    return cached;
+                if (pendingDerivedKeys.Contains(cacheKey))
+                    return (new IntPtr((long)hash), hash);
+            }
+
+            try
+            {
+                Color32[] pixels = ReadTexturePixels(tex);
+                byte[] pixelData = new byte[pixels.Length * 4];
+                bool environmentNamed = NameHas(materialName, "environment", "batch material environment");
+                bool concreteNamed = NameHas(materialName, "concrete", "cement", "stone", "rock", "brick", "wall", "floor", "tile");
+                bool metalNamed = NameHas(materialName, "metal", "steel", "iron", "silver", "chrome", "pipe", "nail", "saw", "blade", "weapon", "gun", "revolver", "shotgun", "railcannon", "barrel");
+                bool viewModelNamed = NameHas(materialName, "v1", "arm", "hand", "view", "weapon", "gun", "nail", "saw", "blade", "revolver", "shotgun", "railcannon", "barrel");
+                for (int i = 0; i < pixels.Length; i++)
+                {
+                    float luminance = (pixels[i].r * 0.2126f + pixels[i].g * 0.7152f + pixels[i].b * 0.0722f) / 255f;
+                    float maxCh = Mathf.Max(pixels[i].r, Mathf.Max(pixels[i].g, pixels[i].b)) / 255f;
+                    float minCh = Mathf.Min(pixels[i].r, Mathf.Min(pixels[i].g, pixels[i].b)) / 255f;
+                    float saturation = maxCh > 0.001f ? (maxCh - minCh) / maxCh : 0f;
+                    float greyReflectMask = Mathf.Clamp01((maxCh - (viewModelNamed ? 0.22f : 0.42f)) / (viewModelNamed ? 0.28f : 0.38f)) * Mathf.Clamp01(((viewModelNamed ? 0.42f : 0.28f) - saturation) / (viewModelNamed ? 0.42f : 0.28f));
+                    float baseRoughness = Mathf.Clamp(0.85f - luminance * 0.25f - saturation * 0.10f, 0.35f, 0.95f);
+                    if (environmentNamed)
+                        baseRoughness = 0.85f;
+                    if (concreteNamed)
+                        baseRoughness = Mathf.Max(baseRoughness, 0.88f);
+                    float reflectiveMask = metalNamed || viewModelNamed ? Mathf.Pow(greyReflectMask, 0.4f) : Mathf.Pow(greyReflectMask, 0.7f);
+                    float roughness = Mathf.Lerp(baseRoughness, metalNamed || viewModelNamed ? 0.02f : 0.08f, concreteNamed || environmentNamed ? 0f : reflectiveMask);
+                    byte r = (byte)(roughness * 255f);
+                    pixelData[i * 4 + 0] = r;
+                    pixelData[i * 4 + 1] = r;
+                    pixelData[i * 4 + 2] = r;
+                    pixelData[i * 4 + 3] = 255;
+                }
+
+                pixelData = DumpAndLoadDerivedTexture($"{materialName}_{tex.name}", "albedorough", hash, tex.width, tex.height, pixelData);
+                QueueDerivedTextureUpload(cacheKey, hash, pixelData, tex.width, tex.height);
+                return (new IntPtr((long)hash), hash);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError($"Exception deriving roughness from albedo '{tex.name}': {ex.Message}");
+                return (IntPtr.Zero, 0);
+            }
+        }
+
+        private (IntPtr handle, ulong hash) UploadAlbedoDerivedMetallicTexture(Texture2D tex, string materialName)
+        {
+            if (tex == null || createTextureFunc == null)
+                return (IntPtr.Zero, 0);
+
+            ulong nameHash = Fnv1a64(materialName ?? string.Empty);
+            long cacheKey = ((long)tex.GetInstanceID() << 24) ^ 0x414C424DL ^ (long)nameHash;
+            ulong hash = BuildDerivedCacheHash(tex, "albedometal") ^ nameHash;
+
+            lock (pendingTextureLock)
+            {
+                if (derivedTextureCache.TryGetValue(cacheKey, out var cached))
+                    return cached;
+                if (pendingDerivedKeys.Contains(cacheKey))
+                    return (new IntPtr((long)hash), hash);
+            }
+
+            try
+            {
+                Color32[] pixels = ReadTexturePixels(tex);
+                byte[] pixelData = new byte[pixels.Length * 4];
+                bool environmentNamed = NameHas(materialName, "environment", "batch material environment");
+                bool concreteNamed = NameHas(materialName, "concrete", "cement", "stone", "rock", "brick", "wall", "floor", "tile");
+                bool metalNamed = NameHas(materialName, "metal", "steel", "iron", "silver", "chrome", "pipe", "nail", "saw", "blade", "weapon", "gun", "revolver", "shotgun", "railcannon", "barrel");
+                bool viewModelNamed = NameHas(materialName, "v1", "arm", "hand", "view", "weapon", "gun", "nail", "saw", "blade", "revolver", "shotgun", "railcannon", "barrel");
+                for (int i = 0; i < pixels.Length; i++)
+                {
+                    float maxCh = Mathf.Max(pixels[i].r, Mathf.Max(pixels[i].g, pixels[i].b)) / 255f;
+                    float minCh = Mathf.Min(pixels[i].r, Mathf.Min(pixels[i].g, pixels[i].b)) / 255f;
+                    float saturation = maxCh > 0.001f ? (maxCh - minCh) / maxCh : 0f;
+                    float greyReflectMask = Mathf.Clamp01((maxCh - (viewModelNamed ? 0.22f : 0.42f)) / (viewModelNamed ? 0.28f : 0.38f)) * Mathf.Clamp01(((viewModelNamed ? 0.42f : 0.28f) - saturation) / (viewModelNamed ? 0.42f : 0.28f));
+                    float metallic = concreteNamed || environmentNamed ? 0f : Mathf.Pow(greyReflectMask, metalNamed || viewModelNamed ? 0.35f : 0.75f);
+                    byte m = (byte)(metallic * 255f);
+                    pixelData[i * 4 + 0] = m;
+                    pixelData[i * 4 + 1] = m;
+                    pixelData[i * 4 + 2] = m;
+                    pixelData[i * 4 + 3] = 255;
+                }
+
+                pixelData = DumpAndLoadDerivedTexture($"{materialName}_{tex.name}", "albedometal", hash, tex.width, tex.height, pixelData);
+                QueueDerivedTextureUpload(cacheKey, hash, pixelData, tex.width, tex.height);
+                return (new IntPtr((long)hash), hash);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError($"Exception deriving metallic from albedo '{tex.name}': {ex.Message}");
+                return (IntPtr.Zero, 0);
+            }
+        }
+
+        private (IntPtr handle, ulong hash) UploadAlbedoDerivedNormalTexture(Texture2D tex)
+        {
+            if (tex == null || createTextureFunc == null)
+                return (IntPtr.Zero, 0);
+
+            long cacheKey = ((long)tex.GetInstanceID() << 24) ^ 0x414C424EL;
+            ulong hash = BuildDerivedCacheHash(tex, "albedonormal");
+
+            lock (pendingTextureLock)
+            {
+                if (derivedTextureCache.TryGetValue(cacheKey, out var cached))
+                    return cached;
+                if (pendingDerivedKeys.Contains(cacheKey))
+                    return (new IntPtr((long)hash), hash);
+            }
+
+            try
+            {
+                Color32[] pixels = ReadTexturePixels(tex);
+                byte[] pixelData = new byte[pixels.Length * 4];
+                float strength = 2.0f;
+
+                for (int y = 0; y < tex.height; y++)
+                {
+                    for (int x = 0; x < tex.width; x++)
+                    {
+                        int i = y * tex.width + x;
+                        float hL = AlbedoHeight(pixels[y * tex.width + Mathf.Max(0, x - 1)]);
+                        float hR = AlbedoHeight(pixels[y * tex.width + Mathf.Min(tex.width - 1, x + 1)]);
+                        float hD = AlbedoHeight(pixels[Mathf.Max(0, y - 1) * tex.width + x]);
+                        float hU = AlbedoHeight(pixels[Mathf.Min(tex.height - 1, y + 1) * tex.width + x]);
+                        float nx = (hL - hR) * strength;
+                        float ny = (hD - hU) * strength;
+                        float nz = 1f;
+                        float len = Mathf.Sqrt(nx * nx + ny * ny + nz * nz);
+                        nx /= len;
+                        ny /= len;
+                        nz /= len;
+
+                        float invL1 = 1f / (Mathf.Abs(nx) + Mathf.Abs(ny) + Mathf.Abs(nz) + 1e-6f);
+                        float ox = nx * invL1;
+                        float oy = ny * invL1;
+                        pixelData[i * 4 + 0] = (byte)(Mathf.Clamp01(ox * 0.5f + 0.5f) * 255f);
+                        pixelData[i * 4 + 1] = (byte)(Mathf.Clamp01(oy * 0.5f + 0.5f) * 255f);
+                        pixelData[i * 4 + 2] = 255;
+                        pixelData[i * 4 + 3] = 255;
+                    }
+                }
+
+                pixelData = DumpAndLoadDerivedTexture(tex.name, "albedonormal", hash, tex.width, tex.height, pixelData);
+                QueueDerivedTextureUpload(cacheKey, hash, pixelData, tex.width, tex.height);
+                return (new IntPtr((long)hash), hash);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError($"Exception deriving normal from albedo '{tex.name}': {ex.Message}");
+                return (IntPtr.Zero, 0);
+            }
+        }
+
+        private byte[] DumpAndLoadDerivedTexture(string sourceName, string kind, ulong hash, int width, int height, byte[] pixelData)
+        {
+            try
+            {
+                string safeName = MakeSafeFileName(sourceName);
+                string path = Path.Combine(derivedTextureDumpDirectory, $"{hash:X16}_{kind}_{safeName}.tga");
+                if (!File.Exists(path))
+                    WriteTgaRgba32(path, width, height, pixelData);
+                byte[] loadedPixels = ReadTgaRgba32(path, width, height);
+                if (verboseTextureLogging.Value)
+                    logger.LogInfo($"Loaded derived {kind} texture '{sourceName}' -> {path}");
+                return loadedPixels;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning($"Failed to dump/load derived {kind} texture '{sourceName}': {ex.Message}");
+            }
+
+            return pixelData;
+        }
+
+        private Color32[] ReadTexturePixels(Texture2D tex)
+        {
+            if (tex.isReadable)
+                return tex.GetPixels32();
+
+            RenderTexture tmp = RenderTexture.GetTemporary(
+                tex.width, tex.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
+            RenderTexture previous = RenderTexture.active;
+            Graphics.Blit(tex, tmp);
+            RenderTexture.active = tmp;
+            Texture2D readable = new Texture2D(tex.width, tex.height, TextureFormat.RGBA32, false, true);
+            readable.ReadPixels(new Rect(0, 0, tmp.width, tmp.height), 0, 0);
+            readable.Apply();
+            RenderTexture.active = previous;
+            RenderTexture.ReleaseTemporary(tmp);
+            Color32[] pixels = readable.GetPixels32();
+            UnityEngine.Object.Destroy(readable);
+            return pixels;
+        }
+
+        private static float AlbedoHeight(Color32 pixel)
+        {
+            return (pixel.r * 0.2126f + pixel.g * 0.7152f + pixel.b * 0.0722f) / 255f;
+        }
+
+        private static bool NameHas(string value, params string[] terms)
+        {
+            if (string.IsNullOrEmpty(value))
+                return false;
+
+            for (int i = 0; i < terms.Length; i++)
+            {
+                if (value.IndexOf(terms[i], StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static ulong Fnv1a64(string value)
+        {
+            ulong hash = 14695981039346656037UL;
+            for (int i = 0; i < value.Length; i++)
+            {
+                hash ^= char.ToLowerInvariant(value[i]);
+                hash *= 1099511628211UL;
+            }
+            return hash;
+        }
+
+        private void QueueDerivedTextureUpload(long cacheKey, ulong hash, byte[] pixelData, int width, int height)
+        {
+            lock (pendingTextureLock)
+            {
+                if (derivedTextureCache.ContainsKey(cacheKey) || pendingDerivedKeys.Contains(cacheKey))
+                    return;
+
+                pendingTextureUploads.Enqueue(new PendingTextureUpload
+                {
+                    texId = -1,
+                    tintedCacheKey = cacheKey,
+                    pixelData = pixelData,
+                    hash = hash,
+                    width = (uint)width,
+                    height = (uint)height,
+                    mipLevels = 1,
+                    format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM
+                });
+                pendingDerivedKeys.Add(cacheKey);
+            }
+        }
+
+        private static void WriteTgaRgba32(string path, int width, int height, byte[] rgba)
+        {
+            byte[] data = new byte[18 + rgba.Length];
+            data[2] = 2;
+            data[12] = (byte)(width & 0xFF);
+            data[13] = (byte)((width >> 8) & 0xFF);
+            data[14] = (byte)(height & 0xFF);
+            data[15] = (byte)((height >> 8) & 0xFF);
+            data[16] = 32;
+            data[17] = 0x28;
+
+            for (int i = 0, o = 18; i < rgba.Length; i += 4, o += 4)
+            {
+                data[o + 0] = rgba[i + 2];
+                data[o + 1] = rgba[i + 1];
+                data[o + 2] = rgba[i + 0];
+                data[o + 3] = rgba[i + 3];
+            }
+
+            File.WriteAllBytes(path, data);
+        }
+
+        private static byte[] ReadTgaRgba32(string path, int width, int height)
+        {
+            byte[] data = File.ReadAllBytes(path);
+            byte[] rgba = new byte[width * height * 4];
+            for (int i = 0, o = 18; i < rgba.Length; i += 4, o += 4)
+            {
+                rgba[i + 0] = data[o + 2];
+                rgba[i + 1] = data[o + 1];
+                rgba[i + 2] = data[o + 0];
+                rgba[i + 3] = data[o + 3];
+            }
+            return rgba;
+        }
+
+        private static string MakeSafeFileName(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+                return "texture";
+
+            foreach (char c in Path.GetInvalidFileNameChars())
+                value = value.Replace(c, '_');
+
+            return value.Length > 80 ? value.Substring(0, 80) : value;
+        }
+
+        private bool TryGetExistingDerivedTexture(Texture2D tex, string kind, ulong hash, out string path, out ulong dumpedHash)
+        {
+            string safeName = MakeSafeFileName(tex != null ? tex.name : null);
+            path = Path.Combine(derivedTextureDumpDirectory, $"{hash:X16}_{kind}_{safeName}.tga");
+            dumpedHash = hash;
+            if (File.Exists(path))
+                return true;
+
+            string pattern = $"*_{kind}_{safeName}.tga";
+            string[] matches = Directory.GetFiles(derivedTextureDumpDirectory, pattern);
+            if (matches.Length > 0)
+            {
+                path = matches[0];
+                string fileName = Path.GetFileName(path);
+                if (!string.IsNullOrEmpty(fileName) && fileName.Length >= 16 && ulong.TryParse(fileName.Substring(0, 16), System.Globalization.NumberStyles.HexNumber, null, out ulong existingHash))
+                {
+                    dumpedHash = existingHash;
+                    return true;
+                }
+                return true;
+            }
+
+            return false;
+        }
+
+        private static ulong BuildDerivedCacheHash(Texture2D tex, string kind)
+        {
+            ulong hash = 14695981039346656037UL;
+            string key = $"{kind}|{tex.GetInstanceID()}|{tex.name}|{tex.width}x{tex.height}|{tex.format}";
+            for (int i = 0; i < key.Length; i++)
+            {
+                hash ^= key[i];
+                hash *= 1099511628211UL;
+            }
+            return hash == 0 ? 1UL : hash;
+        }
         
         /// <summary>
         /// Get texture hash string from handle (for material creation)
@@ -1263,6 +1900,44 @@ namespace UnityRemix
             // >= 10% of sampled pixels are near-transparent → genuine cutout
             return totalSampled > 0 && nearZeroCount * 10 >= totalSampled;
         }
+
+        private static bool SampleAlphaBC1(byte[] rawData)
+        {
+            int blockCount = rawData.Length / 8;
+            int step = Math.Max(1, blockCount / 256);
+            for (int b = 0; b < blockCount; b += step)
+            {
+                int offset = b * 8;
+                ushort color0 = (ushort)(rawData[offset] | (rawData[offset + 1] << 8));
+                ushort color1 = (ushort)(rawData[offset + 2] | (rawData[offset + 3] << 8));
+                if (color0 <= color1)
+                    return true;
+            }
+            return false;
+        }
+
+        private static bool SampleCutoutAlphaBC1(byte[] rawData)
+        {
+            int blockCount = rawData.Length / 8;
+            if (blockCount == 0) return false;
+
+            int sampleCount = Math.Min(blockCount, 1024);
+            int step = Math.Max(1, blockCount / sampleCount);
+            int cutoutBlockCount = 0;
+            int totalSampled = 0;
+
+            for (int b = 0; b < blockCount; b += step)
+            {
+                int offset = b * 8;
+                ushort color0 = (ushort)(rawData[offset] | (rawData[offset + 1] << 8));
+                ushort color1 = (ushort)(rawData[offset + 2] | (rawData[offset + 3] << 8));
+                totalSampled++;
+                if (color0 <= color1)
+                    cutoutBlockCount++;
+            }
+
+            return totalSampled > 0 && cutoutBlockCount * 10 >= totalSampled;
+        }
         
         /// <summary>
         /// Check if a BC3/DXT5 texture has any non-trivial alpha by scanning alpha endpoint
@@ -1359,7 +2034,11 @@ namespace UnityRemix
         {
             if (createMaterialFunc == null)
                 return IntPtr.Zero;
-                
+
+            IntPtr roughnessPathPtr = IntPtr.Zero;
+            IntPtr metallicPathPtr = IntPtr.Zero;
+            IntPtr heightPathPtr = IntPtr.Zero;
+
             try
             {
                 string albedoPath = GetTexturePathFromHandle(matData.albedoHandle);
@@ -1379,28 +2058,37 @@ namespace UnityRemix
                 }
 
                 string emissivePath = GetTexturePathFromHandle(matData.emissiveHandle);
+                string roughnessPath = GetTexturePathFromHandle(matData.roughnessHandle);
+                string metallicPath = GetTexturePathFromHandle(matData.metallicHandle);
+                string heightPath = GetTexturePathFromHandle(matData.heightHandle);
+                if (roughnessPath != null)
+                    roughnessPathPtr = Marshal.StringToHGlobalUni(roughnessPath);
+                if (metallicPath != null)
+                    metallicPathPtr = Marshal.StringToHGlobalUni(metallicPath);
+                if (heightPath != null)
+                    heightPathPtr = Marshal.StringToHGlobalUni(heightPath);
                 if (verboseTextureLogging.Value)
-                    logger.LogInfo($"[MaterialCreate] '{matData.materialName}': albedo={albedoPath ?? "none"}, normal={normalPath ?? "none"}, emissive={emissivePath ?? "none"}, emColor=({matData.emissiveColor.r:F3},{matData.emissiveColor.g:F3},{matData.emissiveColor.b:F3}), emIntensity={matData.emissiveIntensity:F3}, alphaMode={matData.alphaMode}");
+                    logger.LogInfo($"[MaterialCreate] '{matData.materialName}': albedo={albedoPath ?? "none"}, normal={normalPath ?? "none"}, roughness={roughnessPath ?? "none"}, metallic={metallicPath ?? "none"}, height={heightPath ?? "none"}, emissive={emissivePath ?? "none"}, emColor=({matData.emissiveColor.r:F3},{matData.emissiveColor.g:F3},{matData.emissiveColor.b:F3}), emIntensity={matData.emissiveIntensity:F3}, alphaMode={matData.alphaMode}");
                 
                 // Build the OpaqueEXT using the blittable Raw struct for safe pNext chaining
                 var opaqueExt = new RemixAPI.remixapi_MaterialInfoOpaqueEXT_Raw
                 {
                     sType = (int)RemixAPI.remixapi_StructType.REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT,
                     pNext = IntPtr.Zero,
-                    roughnessTexture = IntPtr.Zero,
-                    metallicTexture = IntPtr.Zero,
+                    roughnessTexture = roughnessPathPtr,
+                    metallicTexture = metallicPathPtr,
                     anisotropy = 0.0f,
                     albedoConstant_x = matData.albedoColor.r,
                     albedoConstant_y = matData.albedoColor.g,
                     albedoConstant_z = matData.albedoColor.b,
                     opacityConstant = matData.albedoColor.a,
-                    roughnessConstant = 0.5f,
-                    metallicConstant = 0.0f,
+                    roughnessConstant = matData.roughnessConstant,
+                    metallicConstant = matData.metallicConstant,
                     thinFilmThickness_hasvalue = 0,
                     thinFilmThickness_value = 0.0f,
                     alphaIsThinFilmThickness = 0,
-                    heightTexture = IntPtr.Zero,
-                    displaceIn = 0.0f,
+                    heightTexture = heightPathPtr,
+                    displaceIn = matData.displaceIn,
                     useDrawCallAlphaState = 0,
                     blendType_hasvalue = 0,
                     blendType_value = 0,
@@ -1408,7 +2096,7 @@ namespace UnityRemix
                     // VkCompareOp: 0=NEVER, 6=GREATER_OR_EQUAL, 7=ALWAYS
                     alphaTestType = 7, // kAlways — default: pass all pixels (no alpha test)
                     alphaReferenceValue = 0,
-                    displaceOut = 0.0f
+                    displaceOut = matData.displaceOut
                 };
                 
                 // Configure alpha based on detected mode
@@ -1499,6 +2187,15 @@ namespace UnityRemix
                 logger.LogError($"Exception creating material: {ex.Message}");
                 return IntPtr.Zero;
             }
+            finally
+            {
+                if (roughnessPathPtr != IntPtr.Zero)
+                    Marshal.FreeHGlobal(roughnessPathPtr);
+                if (metallicPathPtr != IntPtr.Zero)
+                    Marshal.FreeHGlobal(metallicPathPtr);
+                if (heightPathPtr != IntPtr.Zero)
+                    Marshal.FreeHGlobal(heightPathPtr);
+            }
         }
         
         /// <summary>
@@ -1550,8 +2247,13 @@ namespace UnityRemix
                             }
                             if (upload.tintedCacheKey != 0)
                             {
-                                tintedTextureCache[upload.tintedCacheKey] = (handle, upload.hash);
-                                pendingTintedKeys.Remove(upload.tintedCacheKey);
+                                if (pendingDerivedKeys.Remove(upload.tintedCacheKey))
+                                    derivedTextureCache[upload.tintedCacheKey] = (handle, upload.hash);
+                                else
+                                {
+                                    tintedTextureCache[upload.tintedCacheKey] = (handle, upload.hash);
+                                    pendingTintedKeys.Remove(upload.tintedCacheKey);
+                                }
                             }
                         }
                     }
@@ -1561,7 +2263,11 @@ namespace UnityRemix
                         lock (pendingTextureLock)
                         {
                             if (upload.texId >= 0) pendingTextureIds.Remove(upload.texId);
-                            if (upload.tintedCacheKey != 0) pendingTintedKeys.Remove(upload.tintedCacheKey);
+                            if (upload.tintedCacheKey != 0)
+                            {
+                                pendingTintedKeys.Remove(upload.tintedCacheKey);
+                                pendingDerivedKeys.Remove(upload.tintedCacheKey);
+                            }
                         }
                     }
                 }
@@ -1710,3 +2416,7 @@ namespace UnityRemix
         }
     }
 }
+
+
+
+

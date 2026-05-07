@@ -16,6 +16,8 @@ A BepInEx plugin that brings NVIDIA RTX Remix path tracing to most modern Unity 
 
 - BepInEx 5.x
 - A Unity 2019+ game that uses MonoBleedingEdge (IL2CPP support will come later)
+<img width="600" alt="image" src="https://github.com/user-attachments/assets/421d12cb-e19d-40bb-89ec-69da1370e653" />
+
 
 ## Installation
 1. Download the latest [release](https://github.com/sambow23/UnityRTX/releases/latest)

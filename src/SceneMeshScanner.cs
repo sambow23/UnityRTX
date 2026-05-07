@@ -340,13 +340,32 @@ namespace UnityRemix
         {
             if (vertices == null || vertices.Length == 0)
                 return Vector3.zero;
-            Vector3 min = vertices[0], max = vertices[0];
-            for (int i = 1; i < vertices.Length; i++)
+            Vector3 sum = Vector3.zero;
+            for (int i = 0; i < vertices.Length; i++)
             {
-                min = Vector3.Min(min, vertices[i]);
-                max = Vector3.Max(max, vertices[i]);
+                sum += vertices[i];
             }
-            return localToWorld.MultiplyPoint3x4((min + max) * 0.5f);
+            return localToWorld.MultiplyPoint3x4(sum / vertices.Length);
+        }
+
+        private static bool ShouldSkipFloorMesh(MeshFilter filter, Renderer renderer, Mesh mesh)
+        {
+            string objectName = filter != null && filter.gameObject != null ? filter.gameObject.name : string.Empty;
+            string rendererName = renderer != null ? renderer.name : string.Empty;
+            string meshName = mesh != null ? mesh.name : string.Empty;
+
+            return IsArchGateFloorName(objectName) || IsArchGateFloorName(rendererName) || IsArchGateFloorName(meshName);
+        }
+
+        private static bool IsArchGateFloorName(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return false;
+
+            return name.IndexOf("batdr_archgate_floor", StringComparison.OrdinalIgnoreCase) >= 0
+                || name.IndexOf("archgate_floor", StringComparison.OrdinalIgnoreCase) >= 0
+                || (name.IndexOf("archgate", StringComparison.OrdinalIgnoreCase) >= 0
+                    && name.IndexOf("floor", StringComparison.OrdinalIgnoreCase) >= 0);
         }
 
         public void ClearData()
@@ -408,6 +427,12 @@ namespace UnityRemix
                 if (mesh == null)
                 {
                     skippedNoMesh++;
+                    scannedFilterIds.Add(filterId);
+                    continue;
+                }
+
+                if (ShouldSkipFloorMesh(filter, renderer, mesh))
+                {
                     scannedFilterIds.Add(filterId);
                     continue;
                 }

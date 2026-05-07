@@ -332,7 +332,7 @@ namespace UnityRemix
                     matData.wrapModeV = UnityWrapToMdl(tex.wrapModeV);
                     matData.filterMode = (byte)(tex.filterMode == FilterMode.Point ? 0 : 1);
                     
-                    matData.albedoHandle = UploadUnityTexture(tex, srgb: true);
+                    matData.albedoHandle = UploadUnityTexture(tex, srgb: false);
                     if (matData.albedoHandle != IntPtr.Zero)
                     {
                         int texId = tex.GetInstanceID();
@@ -540,7 +540,7 @@ namespace UnityRemix
                         
                         if (stanleyEmTex != null)
                         {
-                            matData.emissiveHandle = UploadUnityTexture(stanleyEmTex, srgb: true);
+                            matData.emissiveHandle = UploadUnityTexture(stanleyEmTex, srgb: false);
                             if (matData.emissiveHandle != IntPtr.Zero)
                             {
                                 int emTexId = stanleyEmTex.GetInstanceID();
@@ -680,7 +680,7 @@ namespace UnityRemix
                     width = 1,
                     height = 1,
                     mipLevels = 1,
-                    format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_SRGB
+                    format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM
                 });
                 
                 var handle = new IntPtr((long)hash);
@@ -694,7 +694,7 @@ namespace UnityRemix
         /// but the actual Remix API call is deferred to the render thread via ProcessPendingTextureUploads().
         /// Returns a provisional handle (the texture hash cast to IntPtr).
         /// </summary>
-        public IntPtr UploadUnityTexture(Texture2D unityTexture, bool srgb = true, bool isNormalMap = false)
+        public IntPtr UploadUnityTexture(Texture2D unityTexture, bool srgb = false, bool isNormalMap = false)
         {
             if (unityTexture == null || createTextureFunc == null)
                 return IntPtr.Zero;
@@ -919,7 +919,7 @@ namespace UnityRemix
         /// so we bake the color multiplication into the texture pixels.
         /// Returns (handle, hash) for the uploaded texture.
         /// </summary>
-        private (IntPtr handle, ulong hash) UploadTintedEmissiveTexture(Texture2D tex, Color emissiveColor, bool srgb = true)
+        private (IntPtr handle, ulong hash) UploadTintedEmissiveTexture(Texture2D tex, Color emissiveColor, bool srgb = false)
         {
             if (tex == null || createTextureFunc == null)
                 return (IntPtr.Zero, 0);
@@ -1058,11 +1058,11 @@ namespace UnityRemix
                 else
                 {
                     RenderTexture tmp = RenderTexture.GetTemporary(
-                        tex.width, tex.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                        tex.width, tex.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
                     RenderTexture prev = RenderTexture.active;
                     Graphics.Blit(tex, tmp);
                     RenderTexture.active = tmp;
-                    Texture2D readable = new Texture2D(tex.width, tex.height, TextureFormat.RGBA32, false);
+                    Texture2D readable = new Texture2D(tex.width, tex.height, TextureFormat.RGBA32, false, true);
                     readable.ReadPixels(new Rect(0, 0, tmp.width, tmp.height), 0, 0);
                     readable.Apply();
                     RenderTexture.active = prev;
@@ -1101,7 +1101,7 @@ namespace UnityRemix
                         width = (uint)tex.width,
                         height = (uint)tex.height,
                         mipLevels = 1,
-                        format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_SRGB
+                        format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM
                     });
                     pendingTintedKeys.Add(cacheKey);
                 }
@@ -1617,7 +1617,7 @@ namespace UnityRemix
                     height = size,
                     depth = 1,
                     mipLevels = 1,
-                    format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_SRGB,
+                    format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM,
                     data = pinned.AddrOfPinnedObject(),
                     dataSize = (ulong)pixels.Length
                 };

@@ -332,7 +332,7 @@ namespace UnityRemix
                     matData.wrapModeV = UnityWrapToMdl(tex.wrapModeV);
                     matData.filterMode = (byte)(tex.filterMode == FilterMode.Point ? 0 : 1);
                     
-                    matData.albedoHandle = UploadUnityTexture(tex, srgb: false);
+                    matData.albedoHandle = UploadUnityTexture(tex);
                     if (matData.albedoHandle != IntPtr.Zero)
                     {
                         int texId = tex.GetInstanceID();
@@ -540,7 +540,7 @@ namespace UnityRemix
                         
                         if (stanleyEmTex != null)
                         {
-                            matData.emissiveHandle = UploadUnityTexture(stanleyEmTex, srgb: false);
+                            matData.emissiveHandle = UploadUnityTexture(stanleyEmTex);
                             if (matData.emissiveHandle != IntPtr.Zero)
                             {
                                 int emTexId = stanleyEmTex.GetInstanceID();
@@ -618,7 +618,7 @@ namespace UnityRemix
                 var tex = material.GetTexture("_BumpMap") as Texture2D;
                 if (tex != null)
                 {
-                    matData.normalHandle = UploadUnityTexture(tex, srgb: false, isNormalMap: true);
+                    matData.normalHandle = UploadUnityTexture(tex, isNormalMap: true);
                     if (matData.normalHandle != IntPtr.Zero)
                     {
                         int texId = tex.GetInstanceID();
@@ -694,7 +694,7 @@ namespace UnityRemix
         /// but the actual Remix API call is deferred to the render thread via ProcessPendingTextureUploads().
         /// Returns a provisional handle (the texture hash cast to IntPtr).
         /// </summary>
-        public IntPtr UploadUnityTexture(Texture2D unityTexture, bool srgb = false, bool isNormalMap = false)
+        public IntPtr UploadUnityTexture(Texture2D unityTexture, bool isNormalMap = false)
         {
             if (unityTexture == null || createTextureFunc == null)
                 return IntPtr.Zero;
@@ -752,16 +752,15 @@ namespace UnityRemix
                     if (verboseTextureLogging.Value)
                         logger.LogInfo($"Texture '{unityTexture.name}' is not readable - forcing GPU readback");
                     
-                    RenderTextureReadWrite colorSpace = srgb ? RenderTextureReadWrite.sRGB : RenderTextureReadWrite.Linear;
                     RenderTexture tmp = RenderTexture.GetTemporary(
                         unityTexture.width, unityTexture.height, 0,
-                        RenderTextureFormat.ARGB32, colorSpace);
+                        RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
                     
                     RenderTexture previous = RenderTexture.active;
                     Graphics.Blit(unityTexture, tmp);
                     RenderTexture.active = tmp;
                     
-                    Texture2D readableTexture = new Texture2D(unityTexture.width, unityTexture.height, TextureFormat.RGBA32, false, !srgb);
+                    Texture2D readableTexture = new Texture2D(unityTexture.width, unityTexture.height, TextureFormat.RGBA32, false, true);
                     readableTexture.ReadPixels(new Rect(0, 0, tmp.width, tmp.height), 0, 0);
                     readableTexture.Apply();
                     
@@ -788,8 +787,7 @@ namespace UnityRemix
                     }
                     
                     hashSourceData = pixelData;
-                    format = srgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_SRGB 
-                                  : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM;
+                    format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM;
                     
                     actualMipLevels = 1; // GPU readback only gives top mip
                     UnityEngine.Object.Destroy(readableTexture);
@@ -807,8 +805,7 @@ namespace UnityRemix
                         pixelData[i * 4 + 3] = 255;
                     }
                     hashSourceData = pixelData;
-                    format = srgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_SRGB 
-                                  : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM;
+                    format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM;
                 }
                 else
                 {
@@ -819,20 +816,16 @@ namespace UnityRemix
                     switch (unityTexture.format)
                     {
                         case TextureFormat.RGBA32:
-                            format = srgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_SRGB 
-                                          : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM;
+                            format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM;
                             break;
                         case TextureFormat.BGRA32:
-                            format = srgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_B8G8R8A8_SRGB 
-                                          : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_B8G8R8A8_UNORM;
+                            format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_B8G8R8A8_UNORM;
                             break;
                         case TextureFormat.DXT1:
-                            format = srgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC1_RGB_SRGB 
-                                          : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC1_RGB_UNORM;
+                            format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC1_RGB_UNORM;
                             break;
                         case TextureFormat.DXT5:
-                            format = srgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_SRGB 
-                                          : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_UNORM;
+                            format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_UNORM;
                             break;
                         default:
                             logger.LogWarning($"Unsupported texture format: {unityTexture.format}");
@@ -842,18 +835,15 @@ namespace UnityRemix
                 
                 // Check alpha channel content for uncompressed RGBA formats
                 bool hasAlpha = false;
-                if (format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_SRGB ||
-                    format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM)
+                if (format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM)
                 {
                     hasAlpha = SampleAlphaRGBA(pixelData, alphaOffset: 3, stride: 4);
                 }
-                else if (format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_B8G8R8A8_SRGB ||
-                         format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_B8G8R8A8_UNORM)
+                else if (format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_B8G8R8A8_UNORM)
                 {
                     hasAlpha = SampleAlphaRGBA(pixelData, alphaOffset: 3, stride: 4);
                 }
-                else if (format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_SRGB ||
-                         format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_UNORM)
+                else if (format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_UNORM)
                 {
                     hasAlpha = SampleAlphaBC3(pixelData);
                 }
@@ -867,8 +857,7 @@ namespace UnityRemix
                     // This distinguishes real transparency (decal backgrounds at alpha=0) from
                     // smoothness-as-alpha packing (Standard shader Opaque mode, values ~50-230).
                     bool hasCutoutAlpha;
-                    if (format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_SRGB ||
-                        format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_UNORM)
+                    if (format == RemixAPI.remixapi_Format.REMIXAPI_FORMAT_BC3_UNORM)
                         hasCutoutAlpha = SampleCutoutAlphaBC3(pixelData);
                     else
                         hasCutoutAlpha = SampleCutoutAlphaRGBA(pixelData, alphaOffset: 3, stride: 4);
@@ -919,7 +908,7 @@ namespace UnityRemix
         /// so we bake the color multiplication into the texture pixels.
         /// Returns (handle, hash) for the uploaded texture.
         /// </summary>
-        private (IntPtr handle, ulong hash) UploadTintedEmissiveTexture(Texture2D tex, Color emissiveColor, bool srgb = false)
+        private (IntPtr handle, ulong hash) UploadTintedEmissiveTexture(Texture2D tex, Color emissiveColor)
         {
             if (tex == null || createTextureFunc == null)
                 return (IntPtr.Zero, 0);
@@ -933,7 +922,7 @@ namespace UnityRemix
             // If tint is white, use normal upload path (benefits from per-texId caching)
             if (tintR > 0.99f && tintG > 0.99f && tintB > 0.99f)
             {
-                var handle = UploadUnityTexture(tex, srgb);
+                var handle = UploadUnityTexture(tex);
                 int texId = tex.GetInstanceID();
                 textureHashCache.TryGetValue(texId, out ulong h);
                 return (handle, h);
@@ -960,13 +949,12 @@ namespace UnityRemix
                 }
                 else
                 {
-                    RenderTextureReadWrite colorSpace = srgb ? RenderTextureReadWrite.sRGB : RenderTextureReadWrite.Linear;
                     RenderTexture tmp = RenderTexture.GetTemporary(
-                        tex.width, tex.height, 0, RenderTextureFormat.ARGB32, colorSpace);
+                        tex.width, tex.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
                     RenderTexture prev = RenderTexture.active;
                     Graphics.Blit(tex, tmp);
                     RenderTexture.active = tmp;
-                    Texture2D readable = new Texture2D(tex.width, tex.height, TextureFormat.RGBA32, false, !srgb);
+                    Texture2D readable = new Texture2D(tex.width, tex.height, TextureFormat.RGBA32, false, true);
                     readable.ReadPixels(new Rect(0, 0, tmp.width, tmp.height), 0, 0);
                     readable.Apply();
                     RenderTexture.active = prev;
@@ -1007,8 +995,7 @@ namespace UnityRemix
                         width = (uint)tex.width,
                         height = (uint)tex.height,
                         mipLevels = 1,
-                        format = srgb ? RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_SRGB
-                                      : RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM
+                        format = RemixAPI.remixapi_Format.REMIXAPI_FORMAT_R8G8B8A8_UNORM
                     });
                     pendingTintedKeys.Add(cacheKey);
                 }

@@ -1,11 +1,12 @@
 using System;
+using System.IO;
 using System.Runtime.InteropServices;
 
 namespace UnityRemix
 {
     /// <summary>
-    /// P/Invoke bindings for Remix C API
-    /// Based on remix_c.h from dxvk-remix v0.6.1
+    /// P/Invoke bindings for Remix C API.
+    /// Based on remix_c.h from dxvk-remix v0.6.2.
     /// </summary>
     public static class RemixAPI
     {
@@ -13,7 +14,11 @@ namespace UnityRemix
         
         public const uint REMIXAPI_VERSION_MAJOR = 0;
         public const uint REMIXAPI_VERSION_MINOR = 6;
-        public const uint REMIXAPI_VERSION_PATCH = 1;
+        public const uint REMIXAPI_VERSION_PATCH = 2;
+
+        private const uint LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR = 0x00000100;
+        private const uint LOAD_LIBRARY_SEARCH_DEFAULT_DIRS = 0x00001000;
+        private const int MAX_PATH = 260;
         
         public static ulong REMIXAPI_VERSION_MAKE(uint major, uint minor, uint patch)
         {
@@ -45,6 +50,12 @@ namespace UnityRemix
             REMIXAPI_ERROR_CODE_SET_DLL_DIRECTORY_FAILURE = 9,
             REMIXAPI_ERROR_CODE_GET_FULL_PATH_NAME_FAILURE = 10,
             REMIXAPI_ERROR_CODE_NOT_INITIALIZED = 11,
+            REMIXAPI_ERROR_CODE_HRESULT_NO_REQUIRED_GPU_FEATURES = unchecked((int)0x88960001),
+            REMIXAPI_ERROR_CODE_HRESULT_DRIVER_VERSION_BELOW_MINIMUM = unchecked((int)0x88960002),
+            REMIXAPI_ERROR_CODE_HRESULT_DXVK_INSTANCE_EXTENSION_FAIL = unchecked((int)0x88960003),
+            REMIXAPI_ERROR_CODE_HRESULT_VK_CREATE_INSTANCE_FAIL = unchecked((int)0x88960004),
+            REMIXAPI_ERROR_CODE_HRESULT_VK_CREATE_DEVICE_FAIL = unchecked((int)0x88960005),
+            REMIXAPI_ERROR_CODE_HRESULT_GRAPHICS_QUEUE_FAMILY_MISSING = unchecked((int)0x88960006),
         }
 
         // Struct types - values from remix_c.h
@@ -74,7 +85,12 @@ namespace UnityRemix
             REMIXAPI_STRUCT_TYPE_LIGHT_INFO_USD_EXT = 21,
             REMIXAPI_STRUCT_TYPE_STARTUP_INFO = 22,
             REMIXAPI_STRUCT_TYPE_PRESENT_INFO = 23,
-            REMIXAPI_STRUCT_TYPE_TEXTURE_INFO = 25,
+            REMIXAPI_STRUCT_TYPE_DEPRECATED_LEGACY_PARTICLE_SYSTEM = 24,
+            REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SYSTEM_EXT = 25,
+            REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT = 26,
+            REMIXAPI_STRUCT_TYPE_TEXTURE_INFO = 27,
+            REMIXAPI_STRUCT_TYPE_FOG_INFO = 28,
+            REMIXAPI_STRUCT_TYPE_UI_DRAW_LIST = 29,
         }
 
         public enum remixapi_CameraType : int
@@ -127,6 +143,8 @@ namespace UnityRemix
             REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_TRANSPARENCY_LAYER = 1 << 22,
             REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER = 1 << 23,
             REMIXAPI_INSTANCE_CATEGORY_BIT_LEGACY_EMISSIVE = 1 << 24,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL = 1 << 25,
+            REMIXAPI_INSTANCE_CATEGORY_BIT_FIRST_PERSON_PLAYER_SHADOW = 1 << 26,
         }
 
         #endregion
@@ -315,6 +333,7 @@ namespace UnityRemix
             public remixapi_Float3D radiance;
             public uint isDynamic;       // remixapi_Bool
             public uint ignoreViewModel; // remixapi_Bool
+            public uint ignoreFirstPersonPlayerShadow; // remixapi_Bool
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -563,6 +582,7 @@ namespace UnityRemix
             public IntPtr dxvk_CopyRenderingOutput;
             public IntPtr dxvk_SetDefaultOutput;
             public IntPtr dxvk_GetTextureHash;
+            public IntPtr dxvk_GetSharedD3D11TextureHandle;
             // Object picking utils
             public IntPtr pick_RequestObjectPicking;
             public IntPtr pick_HighlightObjects;
@@ -575,6 +595,12 @@ namespace UnityRemix
             public IntPtr RegisterCallbacks;
             public IntPtr AutoInstancePersistentLights;
             public IntPtr UpdateLightDefinition;
+            public IntPtr DrawScreenOverlay;
+            public IntPtr SetFogState;
+            public IntPtr SetScreenTint;
+            public IntPtr RegisterUITexture;
+            public IntPtr FreeUITexture;
+            public IntPtr SubmitUIDrawList;
         }
 
         #endregion
@@ -584,12 +610,29 @@ namespace UnityRemix
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern IntPtr LoadLibraryW(string lpFileName);
 
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr LoadLibraryExW(string lpFileName, IntPtr hFile, uint dwFlags);
+
         [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
         private static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool FreeLibrary(IntPtr hModule);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetDllDirectoryW(uint nBufferLength, [Out] char[] lpBuffer);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetDllDirectoryW(string lpPathName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFullPathNameW(
+            string lpFileName,
+            uint nBufferLength,
+            [Out] char[] lpBuffer,
+            IntPtr lpFilePart);
 
         private static IntPtr _remixDll = IntPtr.Zero;
 
@@ -613,11 +656,9 @@ namespace UnityRemix
                 return remixapi_ErrorCode.REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
             }
 
-            // Load the Remix DLL
-            IntPtr hModule = LoadLibraryW(dllPath);
+            IntPtr hModule = LoadRemixLibrary(dllPath);
             if (hModule == IntPtr.Zero)
             {
-                int error = Marshal.GetLastWin32Error();
                 return remixapi_ErrorCode.REMIXAPI_ERROR_CODE_LOAD_LIBRARY_FAILURE;
             }
 
@@ -652,6 +693,97 @@ namespace UnityRemix
             remixDll = hModule;
             _remixDll = hModule;
             return remixapi_ErrorCode.REMIXAPI_ERROR_CODE_SUCCESS;
+        }
+
+        private static IntPtr LoadRemixLibrary(string dllPath)
+        {
+            IntPtr hModule = LoadLibraryW(dllPath);
+            if (HasInitializeLibraryExport(hModule))
+            {
+                return hModule;
+            }
+
+            hModule = LoadLibraryExW(
+                dllPath,
+                IntPtr.Zero,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+            if (HasInitializeLibraryExport(hModule))
+            {
+                return hModule;
+            }
+
+            string fullPath = GetAbsolutePath(dllPath);
+            if (fullPath == null)
+            {
+                return IntPtr.Zero;
+            }
+
+            string parentDir = Path.GetDirectoryName(fullPath);
+            if (string.IsNullOrEmpty(parentDir))
+            {
+                return IntPtr.Zero;
+            }
+
+            string previousDllDirectory = GetCurrentDllDirectory();
+            if (!SetDllDirectoryW(parentDir))
+            {
+                return IntPtr.Zero;
+            }
+
+            try
+            {
+                hModule = LoadLibraryW(fullPath);
+                if (HasInitializeLibraryExport(hModule))
+                {
+                    return hModule;
+                }
+            }
+            finally
+            {
+                SetDllDirectoryW(previousDllDirectory);
+            }
+
+            return IntPtr.Zero;
+        }
+
+        private static bool HasInitializeLibraryExport(IntPtr hModule)
+        {
+            if (hModule == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            if (GetProcAddress(hModule, "remixapi_InitializeLibrary") != IntPtr.Zero)
+            {
+                return true;
+            }
+
+            FreeLibrary(hModule);
+            return false;
+        }
+
+        private static string GetAbsolutePath(string dllPath)
+        {
+            var buffer = new char[MAX_PATH];
+            uint result = GetFullPathNameW(dllPath, (uint)buffer.Length, buffer, IntPtr.Zero);
+            if (result == 0 || result >= buffer.Length)
+            {
+                return null;
+            }
+
+            return new string(buffer, 0, (int)result);
+        }
+
+        private static string GetCurrentDllDirectory()
+        {
+            var buffer = new char[MAX_PATH];
+            uint result = GetDllDirectoryW((uint)buffer.Length, buffer);
+            if (result == 0 || result >= buffer.Length)
+            {
+                return string.Empty;
+            }
+
+            return new string(buffer, 0, (int)result);
         }
 
         /// <summary>
